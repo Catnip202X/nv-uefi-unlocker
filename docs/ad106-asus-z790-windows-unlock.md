@@ -26,7 +26,7 @@ At the default 160 W (no Afterburner): stock FP16/BF16 46.84 / 47.26 → unlocke
   or WHEA events. `evidence/ad106-asus-z790/bench/soak-unlocked-216w.json`.
 - Numerical check: FP16/BF16 GEMMs vs an FP64 reference, max relative error 3e-4 / 2e-3 in both states
   (normal rounding; the unlock changes issue rate, not results).
-- Stock at 216 W is within 2 % of stock at 160 W, so the gain is the unlock, not the power limit.
+- Raising the power limit barely moves stock (FP16 46.84 at 160 W vs 48.06 at 216 W + curve, +3 %): the gain is the unlock, not the power.
 - Volatile by design: a Windows restart or power-off returns the card to stock (measured); run the stick
   each boot.
 
