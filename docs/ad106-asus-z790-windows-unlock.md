@@ -1,0 +1,93 @@
+# RTX 4060 Ti 8 GB (AD106, `10de:2803`) — Windows tensor-rate unlock on ASUS ROG MAXIMUS Z790 APEX
+
+Status: **verified**, 2026-10-27. To our knowledge the first public Windows unlock of an RTX 4060 Ti **8 GB**, and the first on an
+ASUS/AMI Z790 board. Built on `nv-uefi-unlocker` v2.1.0 plus two loader fixes (below) that this board needs.
+
+## Result
+
+| TFLOPS (cuBLAS, FP32 accumulate) | Stock 160 W | Unlocked 160 W | Unlocked 216 W | Gain |
+|---|---:|---:|---:|---:|
+| FP16 8192³ | 46.84 | 78.64 | **81.02** | **+73 %** |
+| BF16 8192³ | 47.26 | 80.25 | **82.23** | **+74 %** |
+| TF32 4096³ | 22.72 | 37.10 | 38.38 | +69 % |
+| FP32 4096³ (control) | 12.02 | 12.25 | 12.50 | unchanged |
+| FP16 throughput per SM-GHz | ~17.1 | ~34 | ~34 | **2.0×** |
+
+- Per-clock tensor throughput doubles exactly; the absolute gain is bounded by board power (the unlocked
+  card sits on its power limit at both 160 W and 216 W).
+- Numerical check: FP16/BF16 GEMMs vs an FP64 reference, max relative error 3e-4 / 2e-3 in both states
+  (normal rounding; the unlock changes issue rate, not results).
+- Stock at 216 W is within 2 % of stock at 160 W, so the gain is the unlock, not the power limit.
+- Volatile by design: a Windows restart or power-off returns the card to stock (measured); run the stick
+  each boot.
+
+Method: `bench/bench_gemm.py` — `torch.mm` on contiguous `randn` inputs, reduced-precision reduction disabled,
+5 warm-up + 20 timed iterations, median, two passes; clock/power sampled under load. PyTorch 2.11.0+cu128,
+NVIDIA driver 581.42, Windows 10 Pro 19045. Raw JSON for every run: `evidence/ad106-asus-z790/bench/`.
+
+## Hardware
+
+| | |
+|---|---|
+| GPU | RTX 4060 Ti 8 GB, AD106 rev A1, `10de:2803`, subsystem `1043:88fb`, PCIe 4.0 x8 |
+| VBIOS | 95.06.26.00.c0 (ASUS ROG Strix 4060 Ti image), power limit 160 W default / 216 W max |
+| Board | ASUS ROG MAXIMUS Z790 APEX (AMI UEFI), Intel Core i9-14900K |
+| Firmware state | Secure Boot off, Fast Startup off, UEFI boot from a FAT32 USB partition |
+
+## Transaction evidence (`evidence/ad106-asus-z790/unlock1-success.log`)
+
+```
+BRIDGE-BME: (0,0,1,0) command 0x0003 -> 0x0007
+FWSEC: WPR2 verified
+BOOTER forensic: MAILBOX0=0x67b00001                      <- payload marker
+POST-BOOT: FEAT_PLM=0xffffffff
+POST-BOOT: WPRCFG=0xfffff0ff FBPA=0xffffff0f WPR=0xffffffff
+SELECTOR RESULT: SS0=0x88888888 SS1=0x8
+POST-FLR: verified (selectors survive AON)
+RECONNECT: ConnectController non-recursive ok
+HANDOFF-OUT: ss0=0x88888888 ss1=0x8 readout1=0x00000000 feat_plm=0xffffffff
+CHAIN: LoadImage (FromDevicePath)  -> Windows Boot Manager
+```
+
+Cold-state notes for this card: SS0 differs every boot (`0x2?026154`) and SS1 does too (`0x2` and `0x6`
+observed); neither is a usable stock/unlock discriminator. FBPA PLM is already `0xffffff0f` cold.
+
+## Why stock v2.1.0 resets this board, and the fix
+
+The AMI firmware on this board layers a **pathless GOP splitter child** (no device path, owned by a
+firmware console driver) on top of the NVIDIA GOP. The loader's detach removes the NVIDIA GOP, but the
+splitter child survives. Afterwards, two **recursive** `ConnectController` calls re-bind the console
+stack over that stale child and the firmware resets mid-call:
+
+1. `tx_detach::reconnect_all` (right after the post-FLR verdict) — the first diagnostic log ends exactly there.
+2. `chainload::chain_load_bootmgfw`'s `map -r`-style pass, which recursively connects every PciIo handle,
+   the GPU included.
+
+Fixes (branch `diag-flushlog`):
+
+| Commit | Change |
+|---|---|
+| `4a4b180` | reconnect the vendor GOP **non-recursively**; `\no-reconnect.txt` skips it |
+| `b3ba677` | skip NVIDIA display functions in the pre-chain reconnect pass |
+| `ffacb77` | flush `loader.log` per line, file before console (a reset no longer leaves a 0-byte log); disable the UEFI watchdog; log the display topology around the detach |
+
+With these, replay and unlock both complete and Windows boots normally. On boards with a single GOP (the
+verified H310 desktop) the behaviour is unchanged in effect: the vendor GOP is re-bound and bootmgfw finds it.
+
+Side observation: `gop_belongs_to_target` never matches here because the NVIDIA GOP child path carries an
+`AcpiAdr` node and the prefix compare includes the PCI path's END node. It is harmless on this board (the
+PCI-level recursive disconnect removes the vendor GOP) but worth fixing upstream.
+
+## Reproduce
+
+1. `make-usbroot.ps1 -Family ad102` (v2.1.0 release) — regenerates every firmware asset from pinned public
+   inputs; all hashes match the published table (`v67-ad102-four-plm.bin` `44c36b2d…dc8cb`).
+2. Build the loader from this branch: `cargo efi-tx` → `\EFI\BOOT\BOOTX64.EFI` on a FAT32 partition.
+3. Replay first (no `v67-*.bin` on the stick): expect `TX: execution verified` and a normal Windows boot.
+4. Unlock: add `v67-ad102-four-plm.bin`, cold boot, pick the stick from the boot menu, press Space.
+
+## Credits
+
+`nv-uefi-unlocker` (physicsdolphin) and its bridge bus-master fix (8bit2qubit, PR #5); `gpu-unlock-ada`
+(JustAResearcher) and the four-write Ada payload lineage; TOTORONG's AD103 Windows UEFI port; Zagitta's
+original `gpu-unlock`.
