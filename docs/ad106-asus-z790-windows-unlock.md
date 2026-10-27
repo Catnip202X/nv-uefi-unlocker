@@ -1,7 +1,8 @@
 # RTX 4060 Ti 8 GB (AD106, `10de:2803`) — Windows tensor-rate unlock on ASUS ROG MAXIMUS Z790 APEX
 
 Status: **verified**, 2026-10-27. To our knowledge the first public Windows unlock of an RTX 4060 Ti **8 GB**, and the first on an
-ASUS/AMI Z790 board. Built on `nv-uefi-unlocker` v2.1.0 plus two loader fixes (below) that this board needs.
+ASUS Z790 board. Built on `nv-uefi-unlocker` v2.1.0 plus the loader fixes below, without which this board
+resets right after a successful unlock.
 
 ## Result
 
@@ -36,7 +37,7 @@ NVIDIA driver 581.42, Windows 10 Pro 19045. Raw JSON for every run: `evidence/ad
 | | |
 |---|---|
 | GPU | RTX 4060 Ti 8 GB, AD106 rev A1, `10de:2803`, subsystem `1043:88fb`, PCIe 4.0 x8 |
-| VBIOS | 95.06.26.00.c0 (ASUS ROG Strix 4060 Ti image), power limit 160 W default / 216 W max |
+| VBIOS | 95.06.26.00.c0, the ASUS ROG Strix 4060 Ti image (cross-flashed onto this ASUS 4060 Ti 8 GB); power limit 160 W default / 216 W max |
 | Board | ASUS ROG MAXIMUS Z790 APEX (AMI UEFI), Intel Core i9-14900K |
 | Firmware state | Secure Boot off, Fast Startup off, UEFI boot from a FAT32 USB partition |
 
@@ -63,22 +64,24 @@ observed); neither is a usable stock/unlock discriminator. FBPA PLM is already `
 The AMI firmware on this board layers a **pathless GOP splitter child** (no device path, owned by a
 firmware console driver) on top of the NVIDIA GOP. The loader's detach removes the NVIDIA GOP, but the
 splitter child survives. Afterwards, two **recursive** `ConnectController` calls re-bind the console
-stack over that stale child and the firmware resets mid-call:
+stack over that stale child. The platform resets inside the call: the per-line log ends there, and
+removing the recursion removes the reset.
 
 1. `tx_detach::reconnect_all` (right after the post-FLR verdict) — the first diagnostic log ends exactly there.
 2. `chainload::chain_load_bootmgfw`'s `map -r`-style pass, which recursively connects every PciIo handle,
    the GPU included.
 
-Fixes (branch `diag-flushlog`):
+Fixes (branch `asus-z790-gop-reconnect`):
 
 | Commit | Change |
 |---|---|
-| `4a4b180` | reconnect the vendor GOP **non-recursively**; `\no-reconnect.txt` skips it |
+| `4a4b180`, `95c64f9` | reconnect recursively as before, but **vendor GOP only** when a pathless GOP survived the detach; `\no-reconnect.txt` skips the reconnect |
 | `b3ba677` | skip NVIDIA display functions in the pre-chain reconnect pass |
 | `ffacb77` | flush `loader.log` per line, file before console (a reset no longer leaves a 0-byte log); disable the UEFI watchdog; log the display topology around the detach |
 
 With these, replay and unlock both complete and Windows boots normally. On boards with a single GOP (the
-verified H310 desktop) the behaviour is unchanged in effect: the vendor GOP is re-bound and bootmgfw finds it.
+verified H310 desktop) the reconnect stays recursive exactly as before; the pre-chain pass no longer
+touches the GPU, which `reconnect_all` has already re-bound.
 
 Side observation: `gop_belongs_to_target` never matches here because the NVIDIA GOP child path carries an
 `AcpiAdr` node and the prefix compare includes the PCI path's END node. It is harmless on this board (the
@@ -91,6 +94,9 @@ PCI-level recursive disconnect removes the vendor GOP) but worth fixing upstream
 2. Build the loader from this branch: `cargo efi-tx` → `\EFI\BOOT\BOOTX64.EFI` on a FAT32 partition.
 3. Replay first (no `v67-*.bin` on the stick): expect `TX: execution verified` and a normal Windows boot.
 4. Unlock: add `v67-ad102-four-plm.bin`, cold boot, pick the stick from the boot menu, press Space.
+5. The unlock is volatile: repeat step 4 after every power-off **and every restart** (measured on this board).
+
+Prerequisites: Secure Boot off, Fast Startup off, Windows on GPT/UEFI.
 
 ## Credits
 
