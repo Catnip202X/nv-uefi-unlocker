@@ -5,16 +5,22 @@ ASUS/AMI Z790 board. Built on `nv-uefi-unlocker` v2.1.0 plus two loader fixes (b
 
 ## Result
 
-| TFLOPS (cuBLAS, FP32 accumulate) | Stock 160 W | Unlocked 160 W | Unlocked 216 W | Gain |
+| TFLOPS (cuBLAS, FP32 accumulate) | Stock 160 W | Unlocked 160 W | Unlocked 216 W + curve | Gain |
 |---|---:|---:|---:|---:|
-| FP16 8192³ | 46.84 | 78.64 | **81.02** | **+73 %** |
-| BF16 8192³ | 47.26 | 80.25 | **82.23** | **+74 %** |
-| TF32 4096³ | 22.72 | 37.10 | 38.38 | +69 % |
-| FP32 4096³ (control) | 12.02 | 12.25 | 12.50 | unchanged |
+| FP16 8192³ | 46.84 | 78.64 | **81.47** | **+74 %** |
+| BF16 8192³ | 47.26 | 80.25 | **83.46** | **+77 %** |
+| TF32 4096³ | 22.72 | 37.10 | 38.46 | +69 % |
+| FP32 4096³ (control) | 12.02 | 12.25 | 12.72 | unchanged |
 | FP16 throughput per SM-GHz | ~17.1 | ~34 | ~34 | **2.0×** |
 
+"216 W + curve" = the owner's MSI Afterburner startup profile (power limit 135 % = 216 W, the VBIOS
+maximum, plus a custom V/F curve). Without the curve, 216 W gives FP16 81.02 / BF16 82.23.
+
 - Per-clock tensor throughput doubles exactly; the absolute gain is bounded by board power (the unlocked
-  card sits on its power limit at both 160 W and 216 W).
+  card sits on its power limit at both 160 W and 216 W, ~180 W sustained draw).
+- **10-minute sustained soak** (FP16/BF16 8192³ alternating, result check vs FP64 every 30 s): PASS,
+  mean 79.5 TFLOPS (min 78.2, max 80.8), 2.37–2.43 GHz, ~182 W, max 80 °C, no NVIDIA driver (nvlddmkm)
+  or WHEA events. `evidence/ad106-asus-z790/bench/soak-unlocked-216w.json`.
 - Numerical check: FP16/BF16 GEMMs vs an FP64 reference, max relative error 3e-4 / 2e-3 in both states
   (normal rounding; the unlock changes issue rate, not results).
 - Stock at 216 W is within 2 % of stock at 160 W, so the gain is the unlock, not the power limit.

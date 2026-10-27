@@ -1,0 +1,191 @@
+{
+  "label": "unlocked-216w",
+  "duration_s": 600.0,
+  "windows": [
+    {
+      "t": 30,
+      "tflops": 80.81,
+      "max_rel_err": 0.001942619229489389,
+      "clock_mhz": 2415.0,
+      "power_w": 181.5,
+      "temp_c": 72.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 60,
+      "tflops": 80.08,
+      "max_rel_err": 0.0021991201140596204,
+      "clock_mhz": 2385.0,
+      "power_w": 181.59,
+      "temp_c": 75.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 91,
+      "tflops": 80.02,
+      "max_rel_err": 0.002103688094594107,
+      "clock_mhz": 2385.0,
+      "power_w": 183.11,
+      "temp_c": 77.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 121,
+      "tflops": 79.86,
+      "max_rel_err": 0.002097120374024942,
+      "clock_mhz": 2400.0,
+      "power_w": 182.45,
+      "temp_c": 78.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 151,
+      "tflops": 79.62,
+      "max_rel_err": 0.0020568529488170697,
+      "clock_mhz": 2385.0,
+      "power_w": 186.14,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 181,
+      "tflops": 79.61,
+      "max_rel_err": 0.0020337822346176873,
+      "clock_mhz": 2370.0,
+      "power_w": 183.85,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 211,
+      "tflops": 79.62,
+      "max_rel_err": 0.002090099300234458,
+      "clock_mhz": 2385.0,
+      "power_w": 181.37,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 242,
+      "tflops": 79.53,
+      "max_rel_err": 0.0032819513426108025,
+      "clock_mhz": 2385.0,
+      "power_w": 181.06,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 272,
+      "tflops": 78.6,
+      "max_rel_err": 0.0036328938488650827,
+      "clock_mhz": 2370.0,
+      "power_w": 182.95,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 302,
+      "tflops": 79.38,
+      "max_rel_err": 0.0021476413500037483,
+      "clock_mhz": 2370.0,
+      "power_w": 180.54,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 332,
+      "tflops": 79.13,
+      "max_rel_err": 0.0020735270003980366,
+      "clock_mhz": 2385.0,
+      "power_w": 180.1,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 362,
+      "tflops": 78.17,
+      "max_rel_err": 0.0021165522355868827,
+      "clock_mhz": 2370.0,
+      "power_w": 182.42,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 393,
+      "tflops": 79.32,
+      "max_rel_err": 0.002100457151936297,
+      "clock_mhz": 2385.0,
+      "power_w": 181.53,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 423,
+      "tflops": 79.27,
+      "max_rel_err": 0.003425773822387972,
+      "clock_mhz": 2430.0,
+      "power_w": 180.21,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 453,
+      "tflops": 79.15,
+      "max_rel_err": 0.002161701694405279,
+      "clock_mhz": 2385.0,
+      "power_w": 182.76,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 483,
+      "tflops": 78.92,
+      "max_rel_err": 0.0020672710214564402,
+      "clock_mhz": 2385.0,
+      "power_w": 181.49,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 513,
+      "tflops": 79.56,
+      "max_rel_err": 0.002143631105987069,
+      "clock_mhz": 2385.0,
+      "power_w": 181.52,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 544,
+      "tflops": 79.58,
+      "max_rel_err": 0.0021324193116446766,
+      "clock_mhz": 2385.0,
+      "power_w": 181.53,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 574,
+      "tflops": 79.56,
+      "max_rel_err": 0.0020928326775186204,
+      "clock_mhz": 2385.0,
+      "power_w": 181.62,
+      "temp_c": 79.0,
+      "hw_slowdown": false
+    },
+    {
+      "t": 600,
+      "tflops": 79.56,
+      "max_rel_err": 0.0022078183723277882,
+      "clock_mhz": 2370.0,
+      "power_w": 181.37,
+      "temp_c": 80.0,
+      "hw_slowdown": false
+    }
+  ],
+  "passed": true,
+  "tflops_min": 78.17,
+  "tflops_max": 80.81,
+  "tflops_mean": 79.47,
+  "temp_max_c": 80.0
+}
