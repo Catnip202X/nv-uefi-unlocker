@@ -78,9 +78,9 @@ Fixes (branch `asus-z790-gop-reconnect`):
 
 | Commit | Change |
 |---|---|
-| `4a4b180`, `95c64f9` | reconnect recursively as before, but **vendor GOP only** when a pathless GOP survived the detach; `\no-reconnect.txt` skips the reconnect |
-| `b3ba677` | skip NVIDIA display functions in the pre-chain reconnect pass |
-| `ffacb77` | flush `loader.log` per line, file before console (a reset no longer leaves a 0-byte log); disable the UEFI watchdog; log the display topology around the detach |
+| `c120ad7`, `c3abeec` | reconnect recursively as before, but **vendor GOP only** when a pathless GOP survived the detach; `\no-reconnect.txt` skips the reconnect |
+| `5935fda` | skip NVIDIA display functions in the pre-chain reconnect pass |
+| `7d4bcad` | flush `loader.log` per line, file before console (a reset no longer leaves a 0-byte log); disable the UEFI watchdog; log the display topology around the detach |
 
 With these, replay and unlock both complete and Windows boots normally. On boards with a single GOP (the
 verified H310 desktop) the reconnect stays recursive exactly as before; the pre-chain pass no longer
