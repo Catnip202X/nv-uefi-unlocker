@@ -6,16 +6,18 @@ resets right after a successful unlock.
 
 ## Result
 
-| TFLOPS (cuBLAS, FP32 accumulate) | Stock 160 W | Unlocked 160 W | Unlocked 216 W + curve | Gain |
-|---|---:|---:|---:|---:|
-| FP16 8192³ | 46.84 | 78.64 | **81.47** | **+74 %** |
-| BF16 8192³ | 47.26 | 80.25 | **83.46** | **+77 %** |
-| TF32 4096³ | 22.72 | 37.10 | 38.46 | +69 % |
-| FP32 4096³ (control) | 12.02 | 12.25 | 12.72 | unchanged |
-| FP16 throughput per SM-GHz | ~17.1 | ~34 | ~34 | **2.0×** |
+Matched pair: same card, driver and MSI Afterburner profile (power limit 135 % = 216 W, the VBIOS
+maximum, plus a custom V/F curve); stock = boot without the stick, unlocked = boot through the stick.
 
-"216 W + curve" = the owner's MSI Afterburner startup profile (power limit 135 % = 216 W, the VBIOS
-maximum, plus a custom V/F curve). Without the curve, 216 W gives FP16 81.02 / BF16 82.23.
+| TFLOPS (cuBLAS, FP32 accumulate) | Stock | Unlocked | Gain |
+|---|---:|---:|---:|
+| FP16 8192³ | 48.06 | **81.94** | **+70 %** |
+| BF16 8192³ | 47.78 | **83.53** | **+75 %** |
+| TF32 4096³ | 23.09 | 38.73 | +68 % |
+| FP32 4096³ (control) | 12.72 | 12.73 | 0 % |
+| FP16 throughput per SM-GHz | ~17.1 | ~34 | **2.0×** |
+
+At the default 160 W (no Afterburner): stock FP16/BF16 46.84 / 47.26 → unlocked 78.64 / 80.25 (+68 % / +70 %).
 
 - Per-clock tensor throughput doubles exactly; the absolute gain is bounded by board power (the unlocked
   card sits on its power limit at both 160 W and 216 W, ~180 W sustained draw).
@@ -41,7 +43,7 @@ NVIDIA driver 581.42, Windows 10 Pro 19045. Raw JSON for every run: `evidence/ad
 | Board | ASUS ROG MAXIMUS Z790 APEX (AMI UEFI), Intel Core i9-14900K |
 | Firmware state | Secure Boot off, Fast Startup off, UEFI boot from a FAT32 USB partition |
 
-## Transaction evidence (`evidence/ad106-asus-z790/unlock1-success.log`)
+## Transaction evidence (`evidence/ad106-asus-z790/unlock3-final-build.log`, the branch head)
 
 ```
 BRIDGE-BME: (0,0,1,0) command 0x0003 -> 0x0007
@@ -51,7 +53,8 @@ POST-BOOT: FEAT_PLM=0xffffffff
 POST-BOOT: WPRCFG=0xfffff0ff FBPA=0xffffff0f WPR=0xffffffff
 SELECTOR RESULT: SS0=0x88888888 SS1=0x8
 POST-FLR: verified (selectors survive AON)
-RECONNECT: ConnectController non-recursive ok
+RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)
+RECONNECT: ConnectController ok (recursive=false)
 HANDOFF-OUT: ss0=0x88888888 ss1=0x8 readout1=0x00000000 feat_plm=0xffffffff
 CHAIN: LoadImage (FromDevicePath)  -> Windows Boot Manager
 ```
