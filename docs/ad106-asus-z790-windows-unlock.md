@@ -101,6 +101,10 @@ PCI-level recursive disconnect removes the vendor GOP) but worth fixing upstream
 
 Prerequisites: Secure Boot off, Fast Startup off, Windows on GPT/UEFI.
 
+Validation of this branch: `cargo xt` passes 71/71 (assets 20, sim 51); `cargo efi-tx` builds clean. The loader
+changes themselves are covered by the hardware logs above (`replay3`, `unlock1`-`unlock3`), since `sim/` has no
+firmware display-stack model.
+
 ## Credits
 
 `nv-uefi-unlocker` (physicsdolphin) and its bridge bus-master fix (8bit2qubit, PR #5); `gpu-unlock-ada`
