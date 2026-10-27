@@ -105,6 +105,24 @@ Validation of this branch: `cargo xt` passes 71/71 (assets 20, sim 51); `cargo e
 changes themselves are covered by the hardware logs above (`replay3`, `unlock1`-`unlock3`), since `sim/` has no
 firmware display-stack model.
 
+## Security notes
+
+- **The payload opens privileged GPU register gates for the rest of the power cycle.** Besides FEAT (the
+  rate selectors), the four writes set the WPR and WPR_CFG privilege masks to all-ones, so host software
+  can write registers that normally only NVIDIA's signed firmware may touch. That weakens the GPU's own
+  secure-firmware isolation until the next power-off/restart. Use it on a machine you control, not a
+  shared or multi-tenant host.
+- **Secure Boot must be off** for the unsigned loader. That removes boot-chain verification for every OS
+  on the machine, not just this tool. Turn it back on when you stop using the unlock (or enroll your own
+  key for the loader). If BitLocker is enabled, have the recovery key ready before changing Secure Boot.
+- **The stick runs pre-OS with full hardware access.** Build the loader from source yourself, regenerate
+  the firmware assets with `make-usbroot.ps1` (it verifies every pinned SHA-256), and keep the stick
+  physically under your control. Builds embed a timestamp, so loader hashes are not reproducible across
+  builds; the asset hashes are.
+- **The watchdog is disabled on purpose.** A hung run stays on a black screen until you power off; it
+  does not auto-reset into the stick again (no reboot loop). Recovery is always a power cycle.
+- No NVIDIA firmware is in this repository; nothing is written to the VBIOS, the ESP, or NVRAM.
+
 ## Credits
 
 `nv-uefi-unlocker` (physicsdolphin) and its bridge bus-master fix (8bit2qubit, PR #5); `gpu-unlock-ada`
