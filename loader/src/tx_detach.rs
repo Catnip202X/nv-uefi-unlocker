@@ -277,10 +277,21 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
 /// self-establishes its own console when it starts; this only restores the
 /// display earlier for machines where the dGPU is the primary adapter.
 pub fn reconnect_all(pci_handle: uefi::Handle) {
-    // Give the FLR-rebooted function a moment, then recursive-connect.
+    if crate::tx::read_boot_file("\\no-reconnect.txt").is_some() {
+        info!("RECONNECT: skipped (\\no-reconnect.txt) - bootmgfw self-establishes its console");
+        return;
+    }
+    // Give the FLR-rebooted function a moment, then connect the vendor GOP
+    // driver to the GPU only. NOT recursive: on AMI boards with a pathless
+    // GOP splitter child that survives the detach (ASUS Z790, 2803), the
+    // recursive connect re-binds the splitter/console stack over the stale
+    // child and the firmware resets mid-call. bootmgfw locates the fresh
+    // vendor GOP on its own.
     boot::stall(core::time::Duration::from_millis(200));
-    match boot::connect_controller(pci_handle, &[], None, true) {
-        Ok(()) => info!("RECONNECT: ConnectController recursive ok"),
+    info!("RECONNECT: ConnectController (non-recursive) begin");
+    match boot::connect_controller(pci_handle, &[], None, false) {
+        Ok(()) => info!("RECONNECT: ConnectController non-recursive ok"),
         Err(e) => info!("RECONNECT: ConnectController failed: {:?} (bootmgfw will self-establish)", e.status()),
     }
+    log_display_topology(pci_handle);
 }
