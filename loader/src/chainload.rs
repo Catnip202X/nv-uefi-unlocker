@@ -51,6 +51,20 @@ const NODE_TYPE_END: u8 = 0x7f;
 /// END_ENTIRE node: type 0x7f, subtype 0xff, length 0x0004 (little endian).
 const END_ENTIRE: [u8; 4] = [0x7f, 0xff, 0x04, 0x00];
 
+/// NVIDIA (0x10de) function with display base class 0x03.
+fn is_nvidia_display(handle: uefi::Handle) -> bool {
+    // Safety: GetProtocol, config reads only.
+    let Ok(pci) = (unsafe {
+        boot::open_protocol::<crate::pci::PciIo>(
+            OpenProtocolParams { handle, agent: boot::image_handle(), controller: None },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }) else {
+        return false;
+    };
+    pci.config_read_u16(0x00) == crate::pci::NVIDIA_VENDOR_ID && pci.config_read_u32(0x08) >> 24 == 0x03
+}
+
 pub fn chain_load_bootmgfw() -> Result<()> {
     info!("PHASE: CHAIN");
     // The shell's `map -r` equivalent: before enumerating filesystems,
@@ -58,10 +72,21 @@ pub fn chain_load_bootmgfw() -> Result<()> {
     // bound FAT/SFS instances (ours may have been torn down or left in an
     // intermediate state by the detach/reconnect storm during the
     // transaction; a fresh UEFI shell re-binds and sees everything).
+    // NVIDIA display functions are skipped: tx_detach::reconnect_all already
+    // re-bound the vendor GOP (non-recursively), and a recursive connect on
+    // the GPU re-binds the console stack over the AMI pathless GOP splitter
+    // child that survives the detach - the firmware resets mid-call
+    // (ASUS Z790 + 2803). Block devices are what this pass is for.
     if let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&crate::pci::PciIo::GUID)) {
+        info!("CHAIN: reconnect pass over {} PciIo handles (NVIDIA display skipped)", handles.len());
         for h in handles.iter() {
+            if is_nvidia_display(*h) {
+                info!("CHAIN: reconnect skipped on NVIDIA display {:?}", h);
+                continue;
+            }
             let _ = boot::connect_controller(*h, &[], None, true);
         }
+        info!("CHAIN: reconnect pass done");
         // Let binding callbacks settle before the SFS enumeration.
         boot::stall(core::time::Duration::from_millis(300));
     }
