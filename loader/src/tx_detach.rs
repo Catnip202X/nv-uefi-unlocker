@@ -281,17 +281,33 @@ pub fn reconnect_all(pci_handle: uefi::Handle) {
         info!("RECONNECT: skipped (\\no-reconnect.txt) - bootmgfw self-establishes its console");
         return;
     }
-    // Give the FLR-rebooted function a moment, then connect the vendor GOP
-    // driver to the GPU only. NOT recursive: on AMI boards with a pathless
-    // GOP splitter child that survives the detach (ASUS Z790, 2803), the
-    // recursive connect re-binds the splitter/console stack over the stale
-    // child and the firmware resets mid-call. bootmgfw locates the fresh
-    // vendor GOP on its own.
+    // Give the FLR-rebooted function a moment, then reconnect. Recursive by
+    // default (verified on single-GOP desktops). If a pathless GOP survived
+    // the detach (an AMI splitter child, ASUS Z790 + 2803), connect the
+    // vendor GOP driver only: the recursive connect re-binds the console
+    // stack over the stale child and the platform resets inside the call.
+    // bootmgfw locates the fresh vendor GOP on its own.
     boot::stall(core::time::Duration::from_millis(200));
-    info!("RECONNECT: ConnectController (non-recursive) begin");
-    match boot::connect_controller(pci_handle, &[], None, false) {
-        Ok(()) => info!("RECONNECT: ConnectController non-recursive ok"),
+    let recursive = !stale_pathless_gop();
+    info!("RECONNECT: ConnectController (recursive={recursive}) begin");
+    match boot::connect_controller(pci_handle, &[], None, recursive) {
+        Ok(()) => info!("RECONNECT: ConnectController ok (recursive={recursive})"),
         Err(e) => info!("RECONNECT: ConnectController failed: {:?} (bootmgfw will self-establish)", e.status()),
     }
     log_display_topology(pci_handle);
+}
+
+/// True if any GOP handle without a device path is still installed. Called
+/// after the detach, when the target's vendor GOP is gone: a pathless GOP
+/// left over is a firmware splitter/console child (AMI) that a recursive
+/// reconnect would re-bind over.
+pub fn stale_pathless_gop() -> bool {
+    let Ok(h) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) else {
+        return false;
+    };
+    let stale = h.iter().any(|&gop| device_path_bytes(gop).is_none());
+    if stale {
+        info!("RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)");
+    }
+    stale
 }

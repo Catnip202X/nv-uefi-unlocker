@@ -41,7 +41,6 @@ const ARMED_WAIT: u64 = 5;
 #[entry]
 fn main() -> Status {
     logging::init(VERSION);
-    info!("DIAG build: log flushed per line, file before console");
     // The boot manager arms a 5-minute watchdog before StartImage; a slow
     // or stalled transaction must not be cut short by a firmware reset.
     match uefi::boot::set_watchdog_timer(0, 0x10000, None) {
