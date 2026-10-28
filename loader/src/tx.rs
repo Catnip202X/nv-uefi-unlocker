@@ -1362,18 +1362,23 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
     // 0x0000 over it, wiping MPS/MRR), wait Transactions Pending clear,
     // set the FLR bit preserving the rest of the register, then 100 ms of
     // NO access at all (PCI spec: the function need not respond).
-    let devctl = pci.config_read_u16(0x78 + 0x08);
+    let pcie = crate::pci::pcie_cap_or_measured(pci);
+    let devcap = pci.config_read_u32(pcie as u32 + 0x04);
+    if devcap & (1 << 15) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR - the reset below may be a no-op");
+    }
+    let devctl = pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {
-        let devsta = pci.config_read_u16(0x78 + 0x0a);
+        let devsta = pci.config_read_u16(pcie as u32 + 0x0a);
         if devsta == 0xffff || devsta & 0x20 == 0 {
             break;
         }
         boot::stall(core::time::Duration::from_millis(1));
     }
     pci.cfg_write_u16(0x04, 0x0003); // decode on for the restore, BME off
-    pci.cfg_write_u16(0x78 + 0x08, devctl | 0x8000);
+    pci.cfg_write_u16(pcie as u32 + 0x08, devctl | 0x8000);
     boot::stall(core::time::Duration::from_millis(100)); // spec FLR time, silence
-    pci.cfg_write_u16(0x78 + 0x08, devctl); // restore MPS/MRR, clear FLR bit
+    pci.cfg_write_u16(pcie as u32 + 0x08, devctl); // restore MPS/MRR, clear FLR bit
     // Wait for the function to answer config again before touching BARs.
     for _ in 0..1000 {
         let id = pci.config_read_u32(0x00);
@@ -1390,7 +1395,7 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
     }
     pci.cfg_write_u16(0x04, (saved[0] as u16) & !0x0004);
     let cmd = pci.config_read_u16(0x04);
-    let sta = pci.config_read_u16(0x78 + 0x0a);
+    let sta = pci.config_read_u16(pcie as u32 + 0x0a);
     let gfw = pci.bar_read_u32(0, 0x0011_8234);
     let wpr_hi = pci.bar_read_u32(0, 0x001f_a828);
     info!(

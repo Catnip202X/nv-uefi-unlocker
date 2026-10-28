@@ -928,19 +928,27 @@ pub fn flr_phase(gpu: &TxGpu, family: &str, payload_mode: bool) -> Result<(), Tx
         info!("FLR: BME stuck");
         return Err(TxError::EIO);
     }
-    let devctl = gpu.pci.config_read_u16(0x78 + 0x08);
+    // PCIe capability by walk (Device Control at +0x08), not by the measured
+    // 0x78 constant: a wrong offset would write the FLR bit into an unrelated
+    // dword and the reset would silently never happen.
+    let pcie = crate::pci::pcie_cap_or_measured(gpu.pci);
+    let devcap = gpu.pci.config_read_u32(pcie as u32 + 0x04);
+    if devcap & (1 << 15) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR - continuing (the reset may be a no-op, and a payload verdict must not be lost to it)");
+    }
+    let devctl = gpu.pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {
-        let devsta = gpu.pci.config_read_u16(0x78 + 0x0a);
+        let devsta = gpu.pci.config_read_u16(pcie as u32 + 0x0a);
         if devsta == 0xffff || devsta & 0x20 == 0 {
             break;
         }
         uefi::boot::stall(core::time::Duration::from_millis(1));
     }
-    // PCIe cap at 0x78: Device Control at +0x08; FLR bit 15.
-    gpu.pci.cfg_write_u16(0x78 + 0x08, devctl | 0x8000);
+    // FLR bit 15 of Device Control at the walked offset.
+    gpu.pci.cfg_write_u16(pcie as u32 + 0x08, devctl | 0x8000);
     info!("PCIe FLR triggered");
     uefi::boot::stall(core::time::Duration::from_millis(100)); // no access of any kind to the function
-    gpu.pci.cfg_write_u16(0x78 + 0x08, devctl);
+    gpu.pci.cfg_write_u16(pcie as u32 + 0x08, devctl);
     // Wait for config to answer before any BAR access (TOTORONG GuFlr tail).
     for _ in 0..1000 {
         let id = gpu.pci.config_read_u32(0x00);
