@@ -529,7 +529,13 @@ fn family_of(boot0: u32) -> Option<(&'static str, &'static [(&'static str, u32)]
     } else if (0x160..=0x16F).contains(&die) {
         Some(("turing", &FEAT_TURING))
     } else if (0x170..=0x17F).contains(&die) {
-        Some(("ampere/ga100", &FEAT_AMPADA))
+        // GA100 reads 0x170000a1 plainly (cmp170hx register-reference)
+        Some(("ampere", &FEAT_AMPADA))
+    } else if (0xB70..=0xB7F).contains(&die) {
+        // GA10x BOOT_0 quirk: 0xb7xx00a1 (GA102=0xb74, GA106=0xb76 field-
+        // confirmed 2026-10-28; the "0xb74000a1" note in cmp170hx
+        // register-reference is exactly this). GA100 does NOT do this.
+        Some(("ampere", &FEAT_AMPADA))
     } else if (0x190..=0x19F).contains(&die) {
         // Ada is NV19x (AD106 field read 0x196000a1) - NOT 0x22x (device ids)
         Some(("ada", &FEAT_AMPADA))

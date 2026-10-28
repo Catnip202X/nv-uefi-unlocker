@@ -116,8 +116,10 @@ def family_of(boot0):
         return "volta", None
     if 0x160 <= die <= 0x16F:
         return "turing", TURING
-    if 0x170 <= die <= 0x17F:
-        return "ampere/ga100", GAADA
+    if 0x170 <= die <= 0x17F:  # GA100 reads 0x170000a1 plainly
+        return "ampere", GAADA
+    if 0xB70 <= die <= 0xB7F:  # GA10x quirk: 0xb7xx00a1 (GA102=b74, GA106=b76)
+        return "ampere", GAADA
     if 0x190 <= die <= 0x19F:  # Ada is NV19x, NOT 0x22x (device ids)
         return "ada", GAADA
     if 0x090 <= die <= 0x09F or 0x1A0 <= die <= 0x1AF:
