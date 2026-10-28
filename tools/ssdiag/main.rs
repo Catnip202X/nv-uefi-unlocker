@@ -101,6 +101,10 @@ mod win {
         pub fn GetStdHandle(nStdHandle: u32) -> Handle;
         pub fn GetConsoleMode(hConsole: Handle, mode: *mut u32) -> i32;
         pub fn SetConsoleMode(hConsole: Handle, mode: u32) -> i32;
+        pub fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
     }
 
     #[repr(C)]
@@ -482,6 +486,33 @@ fn deploy_driver() -> Result<(), String> {
         win::CloseServiceHandle(mgr);
     }
     Ok(())
+}
+
+/// Teardown on the paths that never reach `cleanup_driver()` in `main`.
+///
+/// The release profile is `panic = "abort"`, so a panic runs no destructors and
+/// `?`/`unwrap` sites in the probe would leave the kernel service installed and
+/// started, with the extracted `pmxdrv.sys` still in %TEMP%. Hooks are the only
+/// place that code runs on those paths: the panic hook fires before the abort,
+/// and a console control handler fires before the console teardown kills us.
+fn install_crash_cleanup() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        cleanup_driver();
+        default_hook(info);
+    }));
+    // Safety: the handler only calls cleanup_driver(), which re-opens the SCM
+    // itself and is idempotent; it runs on the process's control thread.
+    unsafe {
+        win::SetConsoleCtrlHandler(Some(console_ctrl), 1);
+    }
+}
+
+/// CTRL_C_EVENT / CTRL_BREAK_EVENT / CTRL_CLOSE_EVENT / logoff / shutdown.
+/// Returns 0 so the default handler still terminates the process afterwards.
+unsafe extern "system" fn console_ctrl(_event: u32) -> i32 {
+    cleanup_driver();
+    0
 }
 
 /// Own-the-service cleanup: stop + delete + remove the temp .sys (retry a
@@ -881,6 +912,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
 
 fn main() {
     color_init();
+    install_crash_cleanup();
     let code = run();
     // strict remove-when-done: our own service and temp file never outlive
     // this process - cleanup runs on every path that got past arg parsing.
