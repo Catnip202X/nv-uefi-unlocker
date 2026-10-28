@@ -1,24 +1,47 @@
-# ssdiag — in-OS FEAT-cluster (PLM / SS0 / SS1) reader / re-applier (Windows)
+# ssdiag v0.2 — in-OS NVIDIA register diagnosis + separate-lock re-apply (Windows)
 
-Reads the same NVIDIA registers the EFI unlock stage touches — from inside the
+Reads the NVIDIA registers the EFI unlock stage touches — from inside the
 running OS — and, where the EFI chain left the FEAT PLM gate open (Ampere/Ada
 AON behavior), re-applies the SS override values **without a reboot**
 ("separate-lock" method, issue #6).
 
-## Transport: `pmxdrv.sys` (NOT shipped here)
+## What it dumps
 
-Intel-signed (`Intel(R) Embedded Subsystems and IP Blocks Group`, 2019 build),
-reverse-engineered + live-verified in the nvoc tree
-(`core/src/kmd/pmxdrv.rs` — byte-level protocol copied from there verbatim).
-Not on Microsoft's vulnerable-driver blocklist as of 2026-10 (verified Win11
-26200, HVCI off). Copy `pmxdrv.sys` from the nvoc tree, then (elevated):
+- core/debug block: PMC_BOOT_0, PSTRAPS (decoded BAR1/BAR0/BAR3 sizes),
+  FB_SIZE_MIB, GFW PLM/scratch, BSI_SCRATCH15, WPR2 lo/hi, MMU lock window,
+  GSP/SEC2 CPUCTL + mailboxes + EXCI, fuse override bits — with `badf`
+  bucketing (PRIV_VIOLATION / UNDECODED / FLOORSWEPT).
+- FEAT cluster of BOTH families (Turing 0x4096xx + Ampere/Ada 0x823xxx) on
+  every chip, so nothing depends on getting the family route right.
+- Verdict: SS override values live = unlocked; gate open + stock values =
+  `--reapply` applies (repair path after devinit re-derivation, driver init,
+  sleep, or a rail-up Thunderbolt re-enumeration); gate closed (Turing relock
+  chain) = read-only by design, re-run the USB unlock.
+
+## Driver: embedded, strict remove-when-done
+
+`pmxdrv.sys` (Intel-signed, hash-pinned against the nvoc tree at build time
+and re-verified at startup, fail-closed) is **bundled in the exe**. On run:
+
+1. If a PMXDRV device is already up (e.g. deployed by nvoc), it is borrowed —
+   no service changes.
+2. Otherwise the driver is extracted to `%TEMP%\ssdiag-pmxdrv.sys`, loaded
+   under **its own service name `SSDIAG_PMXDRV`** (kernel, demand-start), and
+   on exit — every exit path — the service is stopped, deleted and the temp
+   file removed. Nothing is left in the user's service list. Cleanup never
+   touches services owned by other tools (the name is ours alone).
+
+Elevation is required for the deploy path (`OpenSCManager`); borrowing an
+already-running driver works unelevated only if the device ACL allows it.
+
+## Usage
 
 ```text
-sc create PMXDRV type= kernel start= demand binPath=C:\path\pmxdrv.sys
-sc start PMXDRV
+ssdiag --bar0 0x50000000            # debug dump + FEAT verdict
+ssdiag --bar0 0x50000000 --reapply  # SS0=0x88888888 SS1=0x8 while the gate is open
 ```
 
-## Find BAR0 physical base
+Find BAR0 physical base:
 
 ```powershell
 $gpu = Get-PnpDevice -Class Display | Where-Object InstanceId -match 'VEN_10DE'
@@ -27,29 +50,20 @@ Get-CimInstance Win32_PnPAllocatedResource |
 # follow the Antecedent -> Win32_DeviceMemory -> StartingAddress
 ```
 
-## Run
+## Build
 
 ```text
-ssdiag --bar0 0x50000000            # read PMC / FEAT_PLM / SS0 / SS1 (+READOUT on Ampere/Ada)
-ssdiag --bar0 0x50000000 --reapply  # SS0=0x88888888 SS1=0x8 while the gate is open
+cargo build --release        # any Windows MSVC host; no cross toolchain needed
 ```
-
-Verdict semantics:
-
-- `FEAT_SS0=0x88888888 SS1=0x8` → override values live = unlocked, regardless
-  of gate state.
-- `PLM OPEN` + stock values → the door is open, `--reapply` applies (this is
-  the repair path for "devinit re-derived the rates" after driver init /
-  sleep / Thunderbolt re-enumeration).
-- `PLM closed` (Turing relock chain) → host writes are dropped by hardware;
-  re-run the USB unlock instead. Reads still work (diagnosis on Turing is
-  read-only by design).
 
 ## Caveats
 
-- Run elevated (kernel driver, service start).
-- The tool never writes the PLM register itself: door-opening stays the EFI
-  stage's job. `--reapply` only writes SS0/SS1 and verifies by read-back.
+- Writes are limited to SS0/SS1 behind an open gate and verified by
+  read-back; the tool never writes the PLM register (door-opening stays the
+  EFI stage's job).
 - BYOVD caveat applies (cmp50hx precedent): some anti-cheats frown on kernel
-  driver use; the driver is demand-start and can be stopped/removed after use
-  (`sc stop PMXDRV && sc delete PMXDRV`).
+  driver use — this one lives for the duration of the probe only, but a
+  simultaneous anti-cheat session may still complain.
+- The transport protocol is copied byte-for-byte from nvoc
+  `core/src/kmd/pmxdrv.rs` (reverse-engineered + live-verified there); the
+  code table was once mis-derived by hand — do not re-derive it.

@@ -1,6 +1,6 @@
 [package]
 name = "ssdiag"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "In-OS NVIDIA FEAT-cluster (PLM/SS0/SS1) reader / re-applier over the pmxdrv physical-memory transport"
@@ -13,6 +13,7 @@ name = "ssdiag"
 path = "main.rs"
 
 [dependencies]
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "z"

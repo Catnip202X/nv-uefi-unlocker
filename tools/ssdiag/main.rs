@@ -1,39 +1,78 @@
-//! ssdiag - in-OS NVIDIA FEAT-cluster (PLM / SS0 / SS1) reader / re-applier.
+//! ssdiag v0.2 - in-OS NVIDIA register diagnosis + separate-lock re-apply.
 //!
-//! Reads the same registers the EFI unlock stage touches, from inside the
-//! running OS, and - where the EFI chain left the PLM gate open (Ampere/Ada
-//! AON behavior, issue #6) - re-applies the SS override values without a
-//! reboot ("separate-lock" method: devinit may re-derive rates from fuses,
-//! but an open gate lets the host write them back).
+//! Reads the registers the EFI unlock stage touches, from inside the running
+//! OS, and - where the EFI chain left the FEAT PLM gate open (Ampere/Ada AON
+//! behavior, issue #6) - re-applies the SS override values without a reboot.
 //!
-//! Transport: the Intel-signed `pmxdrv.sys` (device `\\.\PMXDRV`), the same
-//! fully-reversed protocol as nvoc `core/src/kmd/pmxdrv.rs` (map/unmap
-//! physical memory into this process, PAGE_READWRITE). The driver is NOT
-//! shipped here; install it from the nvoc tree:
-//!   sc create PMXDRV type= kernel start= demand binPath=<path>\pmxdrv.sys
-//!   sc start PMXDRV
-//!
-//! BAR0 physical base must be given (--bar0); from PowerShell:
-//!   $d = Get-PnpDevice -Class Display | ? InstanceId -match 'VEN_10DE'
-//!   Get-CimInstance Win32_PnPAllocatedResource | ? Dependent -match '<DEVID>'
-//!   # then the matching Win32_DeviceMemory.StartingAddress
+//! Driver lifecycle (strict, cmp50hx "remove-when-done" model): the
+//! Intel-signed pmxdrv.sys is EMBEDDED, extracted to %TEMP% on demand,
+//! loaded under its own service name (SSDIAG_PMXDRV), and STOPPED + DELETED
+//! on exit - nothing stays in the user's service list. If a PMXDRV-class
+//! driver is already running (e.g. deployed by nvoc), it is borrowed and
+//! left untouched. Requires elevation for the deploy path.
 //!
 //! Usage:
-//!   ssdiag --bar0 0x50000000            # read PMC/PLM/SS0/SS1 (+READOUT)
-//!   ssdiag --bar0 0x50000000 --reapply  # SS0=0x88888888 SS1=0x8 when open
+//!   ssdiag --bar0 0x50000000             # debug dump + FEAT verdict
+//!   ssdiag --bar0 0x50000000 --reapply   # + SS0=0x88888888 SS1=0x8 when open
 //!
-//! Read-back of the written values is the only success criterion (const. 1.1).
+//! Read-back of written values is the only success criterion (const. 1.1).
 
 #![windows_subsystem = "console"]
 
-use std::ffi::CString;
+use sha2::{Digest, Sha256};
 use std::ptr;
 
-// ---- Win32 prototypes (kernel32), no external crates ----
+// ---------------------------------------------------------------- embedded driver
+
+/// In-tree copy of nvoc `core/src/kmd/pmxdrv.sys` (Intel 2019 Authenticode
+/// build). Pinned hash must equal nvoc's `PMXDRV_SYS_SHA256`; startup
+/// verifies and fails closed on any mismatch.
+const PMXDRV_SYS: &[u8] = include_bytes!("pmxdrv.sys");
+const PMXDRV_SYS_SHA256: &str =
+    "b1a8ee1222eea5f199028d90b9b77c2acf46d6d84a9e125403b2888c6f681c72";
+
+const SERVICE_NAME: &str = "SSDIAG_PMXDRV";
+const TEMP_SYS: &str = "ssdiag-pmxdrv.sys";
+
+// ---------------------------------------------------------------- win32
+
 #[allow(non_snake_case)]
 mod win {
     use std::ffi::c_void;
     pub type Handle = *mut c_void;
+    #[link(name = "advapi32")]
+    extern "system" {
+        pub fn OpenSCManagerW(
+            machine: *const u16,
+            db: *const u16,
+            access: u32,
+        ) -> Handle;
+        pub fn OpenServiceW(h: Handle, name: *const u16, access: u32) -> Handle;
+        pub fn CreateServiceW(
+            h: Handle,
+            name: *const u16,
+            display: *const u16,
+            access: u32,
+            svc_type: u32,
+            start_type: u32,
+            err_type: u32,
+            path: *const u16,
+            order: *const u16,
+            tag: *const u32,
+            deps: *const u16,
+            account: *const u16,
+            password: *const u16,
+        ) -> Handle;
+        pub fn StartServiceW(h: Handle, argc: u32, argv: *const *const u16) -> i32;
+        pub fn ControlService(
+            h: Handle,
+            code: u32,
+            status: *mut ServiceStatus,
+        ) -> i32;
+        pub fn QueryServiceStatus(h: Handle, status: *mut ServiceStatus) -> i32;
+        pub fn DeleteService(h: Handle) -> i32;
+        pub fn CloseServiceHandle(h: Handle) -> i32;
+    }
     #[link(name = "kernel32")]
     extern "system" {
         pub fn CreateFileW(
@@ -58,14 +97,43 @@ mod win {
         pub fn CloseHandle(h: Handle) -> i32;
         pub fn GetLastError() -> u32;
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct ServiceStatus {
+        pub service_type: u32,
+        pub current_state: u32,
+        pub controls_accepted: u32,
+        pub win32_exit: u32,
+        pub specific_exit: u32,
+        pub checkpoint: u32,
+        pub wait_hint: u32,
+    }
 }
 
 const GENERIC_RW: u32 = 0xC000_0000;
 const OPEN_EXISTING: u32 = 3;
+const SC_MANAGER_CREATE_SERVICE: u32 = 0x0002;
+const SERVICE_ALL_ACCESS: u32 = 0x000F_01FF;
+const SERVICE_KERNEL_DRIVER: u32 = 1;
+const SERVICE_DEMAND_START: u32 = 3;
+const SERVICE_ERROR_NORMAL: u32 = 0;
+const SERVICE_CONTROL_STOP: u32 = 1;
+const SERVICE_STOPPED: u32 = 1;
 
-// ---- pmxdrv protocol (byte layout copied verbatim from nvoc
-// core/src/kmd/pmxdrv.rs - the code table was reverse-engineered and
-// live-verified there; do NOT re-derive it) ----
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn last_err() -> u32 {
+    unsafe { win::GetLastError() }
+}
+
+// ---------------------------------------------------------------- pmxdrv transport
+// Byte layout copied verbatim from nvoc core/src/kmd/pmxdrv.rs (reverse-
+// engineered + live-verified there; the code table was mis-derived once by
+// hand - do NOT re-derive).
+
 const DEVICE_PATH: &str = r"\\.\PMXDRV";
 const IOCTL_MAP_PHYS: u32 = 0x222A_B8;
 const IOCTL_UNMAP_PHYS: u32 = 0x222A_BC;
@@ -78,13 +146,13 @@ struct PmxDrv {
 }
 
 impl PmxDrv {
-    fn open() -> Result<Self, String> {
-        let wide: Vec<u16> = DEVICE_PATH.encode_utf16().chain([0]).collect();
+    fn try_open() -> Option<Self> {
+        let wide = wide(DEVICE_PATH);
         let h = unsafe {
             win::CreateFileW(
                 wide.as_ptr(),
                 GENERIC_RW,
-                3, // FILE_SHARE_READ | FILE_SHARE_WRITE
+                3,
                 ptr::null(),
                 OPEN_EXISTING,
                 0,
@@ -92,13 +160,10 @@ impl PmxDrv {
             )
         };
         if h as isize == -1 {
-            let err = unsafe { win::GetLastError() };
-            return Err(format!(
-                "cannot open {DEVICE_PATH} (win32 error {err}) - driver not installed? \
-                 admin: sc create PMXDRV type= kernel start= demand binPath=<path>pmxdrv.sys && sc start PMXDRV"
-            ));
+            None
+        } else {
+            Some(Self { handle: h })
         }
-        Ok(Self { handle: h })
     }
 
     fn forward(&self, ioctl: u32, request: &mut [u8]) -> Result<(), u32> {
@@ -118,12 +183,11 @@ impl PmxDrv {
             )
         };
         if ok == 0 {
-            return Err(unsafe { win::GetLastError() });
+            return Err(last_err());
         }
         Ok(())
     }
 
-    /// Map `pages` pages of physical memory into this process (RW).
     fn map_physical(&self, pa: u64, pages: u32) -> Result<u64, String> {
         let mut request = [0u8; 24];
         request[0..4].copy_from_slice(&REQ_LEN.to_le_bytes());
@@ -154,23 +218,200 @@ impl Drop for PmxDrv {
     }
 }
 
-// ---- FEAT cluster (same tables as tools/diag-unlock.py) ----
+// ---------------------------------------------------------------- driver lifecycle
+
+fn service_stop_and_wait(svc: win::Handle) -> Result<(), String> {
+    let mut st = win::ServiceStatus::default();
+    let sent = unsafe { win::ControlService(svc, SERVICE_CONTROL_STOP, &mut st) };
+    if sent == 0 && st.current_state != SERVICE_STOPPED {
+        return Err(format!("stop refused (win32 {}, state {})", last_err(), st.current_state));
+    }
+    for _ in 0..25 {
+        let mut st = win::ServiceStatus::default();
+        if unsafe { win::QueryServiceStatus(svc, &mut st) } != 0 && st.current_state == SERVICE_STOPPED {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err("stop still pending after 5s".into())
+}
+
+/// Extract + service-create + start. Service name is OURS (SSDIAG_PMXDRV) so
+/// cleanup never touches a driver another tool deployed.
+fn deploy_driver() -> Result<(), String> {
+    // payload integrity, fail closed
+    let mut h = Sha256::new();
+    h.update(PMXDRV_SYS);
+    let got = format!("{:x}", h.finalize());
+    if got != PMXDRV_SYS_SHA256 {
+        return Err(format!("embedded pmxdrv.sys hash mismatch ({got}) - refusing to load"));
+    }
+
+    let sys_path = std::env::temp_dir().join(TEMP_SYS);
+    std::fs::write(&sys_path, PMXDRV_SYS)
+        .map_err(|e| format!("extract to {} failed: {e}", sys_path.display()))?;
+    let readback = std::fs::read(&sys_path).map_err(|e| format!("re-read failed: {e}"))?;
+    if readback != PMXDRV_SYS {
+        return Err("extract re-read mismatch (partial write?)".into());
+    }
+
+    // ImagePath: \??\ + plain absolute path (canonicalize's \\?\ prefix stacks
+    // into an illegal name - nvoc lesson).
+    let abs = if sys_path.is_absolute() {
+        sys_path
+    } else {
+        std::env::current_dir().unwrap().join(&sys_path)
+    };
+    let path_w = wide(format!(r"\??\{}", abs.to_string_lossy()).as_str());
+    let name_w = wide(SERVICE_NAME);
+
+    unsafe {
+        let mgr = win::OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CREATE_SERVICE);
+        if mgr.is_null() {
+            return Err(format!(
+                "OpenSCManager failed (admin required): win32 {}",
+                last_err()
+            ));
+        }
+        // leftover of our own previous run: stop, delete, wait
+        let existing = win::OpenServiceW(mgr, name_w.as_ptr(), SERVICE_ALL_ACCESS);
+        if !existing.is_null() {
+            let _ = service_stop_and_wait(existing);
+            win::DeleteService(existing);
+            win::CloseServiceHandle(existing);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        let svc = win::CreateServiceW(
+            mgr,
+            name_w.as_ptr(),
+            name_w.as_ptr(),
+            SERVICE_ALL_ACCESS,
+            SERVICE_KERNEL_DRIVER,
+            SERVICE_DEMAND_START,
+            SERVICE_ERROR_NORMAL,
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+        );
+        if svc.is_null() {
+            let err = last_err();
+            win::CloseServiceHandle(mgr);
+            return Err(format!("CreateService failed: win32 {err}"));
+        }
+        if win::StartServiceW(svc, 0, ptr::null()) == 0 {
+            let err = last_err();
+            win::DeleteService(svc);
+            win::CloseServiceHandle(svc);
+            win::CloseServiceHandle(mgr);
+            return Err(format!("StartService failed: win32 {err}"));
+        }
+        win::CloseServiceHandle(svc);
+        win::CloseServiceHandle(mgr);
+    }
+    Ok(())
+}
+
+/// Own-the-service cleanup: stop + delete + remove the temp .sys (retry a
+/// short while - the kernel releases the image mapping with a small delay).
+fn cleanup_driver() {
+    unsafe {
+        let mgr = win::OpenSCManagerW(ptr::null(), ptr::null(), SC_MANAGER_CREATE_SERVICE);
+        if mgr.is_null() {
+            return;
+        }
+        let name_w = wide(SERVICE_NAME);
+        let svc = win::OpenServiceW(mgr, name_w.as_ptr(), SERVICE_ALL_ACCESS);
+        if !svc.is_null() {
+            let _ = service_stop_and_wait(svc);
+            win::DeleteService(svc);
+            win::CloseServiceHandle(svc);
+        }
+        win::CloseServiceHandle(mgr);
+    }
+    let sys_path = std::env::temp_dir().join(TEMP_SYS);
+    for _ in 0..10 {
+        if std::fs::remove_file(&sys_path).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn ensure_driver() -> Result<PmxDrv, String> {
+    if let Some(d) = PmxDrv::try_open() {
+        println!("PMXDRV device already running - borrowing it (no service changes)");
+        return Ok(d);
+    }
+    deploy_driver()?;
+    // the kernel can take a beat between StartService and the device symlink
+    for _ in 0..10 {
+        if let Some(d) = PmxDrv::try_open() {
+            return Ok(d);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    PmxDrv::try_open().ok_or_else(|| "service started but \\\\.\\PMXDRV never appeared".into())
+}
+
+// ---------------------------------------------------------------- register dump
+
 const SS0_UNLOCK: u32 = 0x8888_8888;
 const SS1_UNLOCK: u32 = 0x8;
-const TURING: [( &str, u32); 3] = [("PLM", 0x0040_9650), ("SS0", 0x0040_9664), ("SS1", 0x0040_966C)];
-const GAADA: [(&str, u32); 4] = [
+
+const FEAT_TURING: [(&str, u32); 3] =
+    [("PLM", 0x0040_9650), ("SS0", 0x0040_9664), ("SS1", 0x0040_966C)];
+const FEAT_AMPADA: [(&str, u32); 4] = [
     ("PLM", 0x0082_3804),
     ("SS0", 0x0082_381C),
     ("SS1", 0x0082_3820),
-    ("READOUT", 0x0082_3818),
+    ("READOUT_1", 0x0082_3818),
 ];
+/// Readable-at-PL0 core/debug block. Data-driven on purpose: add rows here
+/// as the debug surface grows.
+const CORE_ROWS: [(&str, u32); 17] = [
+    ("PMC_BOOT_0", 0x0000_0000),
+    ("PSTRAPS_SET0", 0x0010_1000),
+    ("PSTRAPS_SET1", 0x0010_100C),
+    ("FB_SIZE_MIB", 0x0011_83A4),
+    ("GFW_PLM", 0x0011_8128),
+    ("GFW_SCRATCH", 0x0011_8234),
+    ("BSI_SCRATCH15", 0x0011_80FC),
+    ("WPR2_LO", 0x001F_A824),
+    ("WPR2_HI", 0x001F_A828),
+    ("MMU_LOCK_LO", 0x001F_A82C),
+    ("MMU_LOCK_HI", 0x001F_A830),
+    ("GSP_CPUCTL", 0x0011_0100),
+    ("GSP_EXCI", 0x0011_00D0),
+    ("SEC2_CPUCTL", 0x0084_0100),
+    ("SEC2_MBOX0", 0x0084_0040),
+    ("SEC2_MBOX1", 0x0084_0044),
+    ("SEC2_EXCI", 0x0084_00D0),
+];
+/// Privileged block - usually badf at PL0, still worth the record.
+const PRIV_ROWS: [(&str, u32); 2] =
+    [("FUSE_OPT_FEATURE_OVR", 0x0082_03F0), ("FUSE_VER", 0x0082_4140)];
+
+fn badf_bucket(v: u32) -> Option<&'static str> {
+    if v >> 16 != 0xBADF {
+        return None;
+    }
+    Some(match v {
+        0xBADF_5040 => "PRIV_VIOLATION",
+        0xBADF_1100 => "UNDECODED",
+        _ if (v & 0xFF00) == 0x2000 => "FLOORSWEPT",
+        _ => "BADF",
+    })
+}
 
 fn family_of(boot0: u32) -> Option<(&'static str, &'static [(&'static str, u32)])> {
     let die = (boot0 >> 20) & 0xFFF;
     if (0x160..=0x16F).contains(&die) {
-        Some(("turing", &TURING))
+        Some(("turing", &FEAT_TURING))
     } else if (0x170..=0x17F).contains(&die) || (0x220..=0x22F).contains(&die) || die == 0x100 {
-        Some(("ampere/ada", &GAADA))
+        Some(("ampere/ada", &FEAT_AMPADA))
     } else {
         None
     }
@@ -202,7 +443,69 @@ fn decode_ss(v: u32, width: u32) -> String {
         .join(" ")
 }
 
+fn dump_debug(rd: &dyn Fn(u32) -> u32) {
+    println!("--- core/debug block ---");
+    for (name, off) in CORE_ROWS {
+        let v = rd(off);
+        match badf_bucket(v) {
+            Some(b) => println!("{name:<22} = {v:#010x} [{b}]"),
+            None => println!("{name:<22} = {v:#010x}"),
+        }
+    }
+    // PSTRAPS decode (loader sample.rs fields, NvStrapsReBar-verified)
+    let s0 = rd(0x0010_1000);
+    let s1 = rd(0x0010_100C);
+    const BAR1_SIZES: [&str; 11] = [
+        "64MiB", "128MiB", "256MiB", "512MiB", "1GiB", "2GiB", "4GiB", "8GiB", "16GiB", "32GiB",
+        "64GiB",
+    ];
+    let bar1_idx = ((s0 >> 14) & 0x3) + ((s1 >> 20) & 0x7);
+    let bar0_idx = (s1 >> 17) & 0x7;
+    println!(
+        "  PSTRAPS: BAR1 index {bar1_idx} = {}   BAR0 = {}MiB   BAR3 = {}xBAR0   override_en = {}",
+        BAR1_SIZES.get(bar1_idx as usize).copied().unwrap_or("reserved(>10)"),
+        16 << bar0_idx,
+        if s1 & 0x0080_0000 != 0 { 1 } else { 2 },
+        s0 >> 31
+    );
+    println!("--- FEAT cluster (both families, cross-visibility) ---");
+    for (label, regs) in [
+        ("turing 0x4096xx", &FEAT_TURING[..]),
+        ("ampere/ada 0x823xxx", &FEAT_AMPADA[..]),
+    ] {
+        for (name, off) in regs {
+            let v = rd(*off);
+            let note = match *name {
+                "PLM" => format!(" ({})", decode_plm(v)),
+                "SS0" => format!(" [{}]", decode_ss(v, 8)),
+                "SS1" => format!(" [{}]", decode_ss(v, 1)),
+                "READOUT_1" => match badf_bucket(v) {
+                    Some(b) => format!(" [{b}]"),
+                    None if v == 0 => " [full speed]".into(),
+                    None => String::new(),
+                },
+                _ => String::new(),
+            };
+            println!("  {label:<20} {name:<9} = {v:#010x}{note}");
+        }
+    }
+    for (name, off) in PRIV_ROWS {
+        let v = rd(off);
+        let note = badf_bucket(v).map(|b| format!(" [{b}]")).unwrap_or_default();
+        println!("{name:<22} = {v:#010x}{note}");
+    }
+}
+
 fn main() {
+    let code = run();
+    // strict remove-when-done: our own service and temp file never outlive
+    // this process - cleanup runs on every path that got past arg parsing.
+    cleanup_driver();
+    println!("driver service removed (remove-when-done)");
+    std::process::exit(code);
+}
+
+fn run() -> i32 {
     let mut bar0: Option<u64> = None;
     let mut reapply = false;
     let mut args = std::env::args().skip(1);
@@ -222,21 +525,21 @@ fn main() {
             "--reapply" => reapply = true,
             other => {
                 eprintln!("unknown arg {other:?}; usage: ssdiag --bar0 0x50000000 [--reapply]");
-                std::process::exit(2);
+                return 2;
             }
         }
     }
     let Some(bar0) = bar0 else {
         eprintln!("usage: ssdiag --bar0 <BAR0 physical base, e.g. 0x50000000> [--reapply]");
         eprintln!("BAR0 base: Device Manager -> GPU -> Resources, or the PowerShell snippet in tools/ssdiag/README.md");
-        std::process::exit(2);
+        return 2;
     };
 
-    let drv = match PmxDrv::open() {
+    let drv = match ensure_driver() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            return 2;
         }
     };
 
@@ -245,34 +548,28 @@ fn main() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("map BAR0@{bar0:#x} failed: {e}");
-            std::process::exit(1);
+            return 1;
         }
     };
     let base = va as *const u8;
-    let rd = |off: u32| unsafe { ((base.add(off as usize)) as *const u32).read_volatile() };
-    let wr = |off: u32, v: u32| unsafe { ((base.add(off as usize)) as *mut u32).write_volatile(v) };
+    let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
+    let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
 
     let boot0 = rd(0x0);
-    let Some((fam, regs)) = family_of(boot0) else {
+    let fam = family_of(boot0);
+    dump_debug(&rd);
+
+    let Some((fam_name, regs)) = fam else {
         eprintln!("PMC_BOOT_0={boot0:#010x} - unsupported chip");
-        drv.unmap_physical(va);
-        std::process::exit(1);
+        return 1;
     };
     let get = |name: &str| regs.iter().find(|(n, _)| *n == name).unwrap().1;
     let plm = rd(get("PLM"));
     let ss0 = rd(get("SS0"));
     let ss1 = rd(get("SS1"));
-    println!("PMC_BOOT_0={boot0:#010x} family={fam}");
-    println!("FEAT_PLM  = {plm:#010x} ({})", decode_plm(plm));
-    println!("FEAT_SS0  = {ss0:#010x} [{}]", decode_ss(ss0, 8));
-    println!("FEAT_SS1  = {ss1:#010x} [{}]", decode_ss(ss1, 1));
-    if let Some((_, ro_off)) = regs.iter().find(|(n, _)| *n == "READOUT") {
-        let ro = rd(*ro_off);
-        println!("READOUT_1 = {ro:#010x}");
-    }
     let unlocked = ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK;
     println!(
-        "VERDICT: {}",
+        "VERDICT [{fam_name}]: {}",
         if unlocked { "UNLOCKED (override values live)" } else { "not unlocked" }
     );
 
@@ -295,11 +592,5 @@ fn main() {
         }
     }
     drv.unmap_physical(va);
-    std::process::exit(rc);
-}
-
-// keep CString import used only if device path needed ASCII fallback later
-#[allow(dead_code)]
-fn _ascii(s: &str) -> CString {
-    CString::new(s).unwrap()
+    rc
 }
