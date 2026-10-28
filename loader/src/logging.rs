@@ -47,22 +47,25 @@ impl Log for DualLogger {
             record.args()
         );
 
+        // File mirror FIRST, flushed per line: a hang or reset anywhere in
+        // the run must still leave every line up to it on the stick (FAT
+        // only commits size/dirent on Flush/Close). The console comes second
+        // because a dangling console chain is itself a suspected crash site.
+        // Safety: single-threaded boot services; pointer use is confined here.
+        unsafe {
+            if let Some(f) = (*self.file.get()).as_mut() {
+                if f.write(line.as_bytes()).is_err() || f.flush().is_err() {
+                    // Media pulled: stop trying, keep console alive.
+                    *self.file.get() = None;
+                }
+            }
+        }
+
         // Console mirror.
         if let Ok(s) = CString16::try_from(line.as_str()) {
             system::with_stdout(|out| {
                 let _ = out.output_string_lossy(&s);
             });
-        }
-
-        // File mirror.
-        // Safety: single-threaded boot services; pointer use is confined here.
-        unsafe {
-            if let Some(f) = (*self.file.get()).as_mut() {
-                if f.write(line.as_bytes()).is_err() {
-                    // Media pulled: stop trying, keep console alive.
-                    *self.file.get() = None;
-                }
-            }
         }
     }
 

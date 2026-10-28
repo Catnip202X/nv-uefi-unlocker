@@ -41,6 +41,12 @@ const ARMED_WAIT: u64 = 5;
 #[entry]
 fn main() -> Status {
     logging::init(VERSION);
+    // The boot manager arms a 5-minute watchdog before StartImage; a slow
+    // or stalled transaction must not be cut short by a firmware reset.
+    match uefi::boot::set_watchdog_timer(0, 0x10000, None) {
+        Ok(()) => info!("WATCHDOG: disabled"),
+        Err(e) => info!("WATCHDOG: disable failed: {:?}", e.status()),
+    }
     banner::print(VERSION);
 
     // Phase: CONFIRM. TX builds: ONLY Space proceeds - timeout or any other
