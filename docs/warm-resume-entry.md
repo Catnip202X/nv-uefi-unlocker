@@ -1,5 +1,7 @@
 # 休眠恢复（warm/resume 入口）下的解锁：log 为什么绿、Windows 为什么坏
 
+> 状态补注（2026-10-28）：以下三种机制仍需系统侧读回区分，不能仅凭 EFI 日志断言交棒后发生了断电。仓库现提供 [Windows ssdiag v0.2](../tools/ssdiag/README.md) 和 Linux `tools/diag-unlock.py`；下文 nvoc 探针为历史方法。#6 的另一台 GA104M 混合输出平台也报告 EFI 成功后无收益，尚待复测，见[社区汇总](community-reports.md)。
+
 2026-10-26，AD107M/28e0，混合模式，休眠唤醒后进 U 盘的一次完整运行。事务本身
 逐项绿：`MAILBOX0=0x67b00001`、`FEAT_PLM=0xffffffff`、`WPRCFG=0xfffff0ff`、
 `WPR=0xffffffff`、SS0/SS1 写入并读回 `0x88888888/0x8`、签名已还原、FLR 后

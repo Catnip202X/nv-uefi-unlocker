@@ -1,4 +1,4 @@
-﻿# nv-uefi-unlocker
+# nv-uefi-unlocker
 
 [中文](README.md) | [English](README.en.md)
 
@@ -23,6 +23,7 @@ v2.1.0 起 30 系全系兼容。** 支持矩阵：
   wait_plm 判据 PLM 翻转 + SS0/SS1 读回全对，AMD 平台 + 刷过跨厂 VBIOS
   均通过）；同链在上游社区工具已覆盖 3060（2487，+58~85%）。**30 系用户
   无需** Turing 的 GSP 固件模式前置。
+  补充实测：3080（`2206`）、3070 Laptop（`249d`）、3080 Ti Laptop（`2420`），见[社区验证汇总](docs/community-reports.md)。
 - **RTX 40 系（Ada）✅ 实测支持**——RTX 4060 Laptop（`10de:28e0`，AD107M）
   四写解锁双端验证：固件侧 marker `0x67b00001` + 四 PLM 读回，Windows 侧
   FP16 GEMM 29.89 → 49.33 TFLOPS（1.65×）。完整报告见
@@ -37,7 +38,7 @@ FLR 会重锁 PLM、Windows 驱动需 GSP 模式——均与 Ada 不同）。
 
 | 文件 | 作用 | 必需 |
 | --- | --- | --- |
-| `BOOTX64.EFI` | 本工具（先备份 U 盘原有同名文件） | ✅ |
+| `\EFI\BOOT\BOOTX64.EFI` | 本工具（先备份该路径原有文件） | ✅ |
 | `booter_load_ad102.bin` | AD102-family Booter bundle（BTL1） | ✅ |
 | `gsp_boot_ad102.bin` + `gsp_boot_desc_ad102.bin` | GSP-RM boot 段 + v5 描述符 | ✅ |
 | `fwimage_ad102.bin` | GSP-RM 固件镜像（~80 MiB，radix3 装载） | ✅ |
@@ -50,8 +51,9 @@ FLR 会重锁 PLM、Windows 驱动需 GSP 模式——均与 Ada 不同）。
 | `chain-target.txt` | 链回目标钉定：第一个非空且非 `#` 的行 = 优先尝试的 EFI 路径（如 `\EFI\limine\limine_x64.efi`），逐卷尝试；全卷找不到则回退默认顺序并留痕（issue #8 建议） | 可选 |
 | `\loader.log` | （运行产物）全部阶段日志，evidence record | 输出 |
 
-不放 `v67-*.bin` 即为**回放/诊断模式**：走完全链但零解锁写入（刷存在感
-的安全/取证模式）。日志中 `family 'xxx' transaction track not enabled`
+表中使用 Ada 资产名；GA10x 和 Turing 分别在 maker 中选择 `ga102`、`tu10x`。启动文件放在 `\EFI\BOOT\BOOTX64.EFI`，所选家族的 `.bin` 与可选标记文件放在盘根。当前 maker 输出为平铺目录，还含抽取中间文件：按脚本末尾 `expected` 清单选取该家族文件，并为启动文件建立 `EFI/BOOT/` 目录，不必复制全部中间固件镜像。
+
+不放 `v67-*.bin` 即为**回放/诊断模式**：走完全链但不执行解锁载荷。它仍会断开驱动、启动签名固件，并可能复位 GPU，属于写事务；只读采样应使用 `cargo efi` 构建。日志中 `family 'xxx' transaction track not enabled`
 表示该芯片族尚未开放事务（20/30/40 三族均已接入；缺资产则跳过）。
 
 **多卡**：机内多张受支持的卡时，缺省按固件枚举顺序**逐张处理**——一张
@@ -64,7 +66,7 @@ emergency FLR、不阻断后续；控制台在另一张卡上时全程有屏（G
 
 1. BIOS：关 Secure Boot。显示模式/进入方式按下面的实测表选——**推荐独显直连**，
    混合模式只在"重启、且 dGPU 有电"这一种进入方式下可用（见原因分析）。
-2. U 盘启动 → 版本屏 → **空格确认**（30 秒无操作自动回 Windows）。若 U 盘根
+2. U 盘启动 → 版本屏 → **空格确认**（回车或其他键均中止；30 秒无操作自动回 Windows）。若 U 盘根
    存在 `i_know_what_i_am_doing.txt`（武装模式），确认环节变为 **5 秒倒计时后
    自动运行**，倒计时内按任意键终止——文件本身就是明确的运行意图声明，供
    自动化/无人值守场景使用；缺省（无此文件）永远是"必须有人按键确认"。
@@ -301,7 +303,7 @@ claim(断 GOP/驱动+独占) → scrubber(BSI handoff 1→3) → FWSEC-FRTS(WPR2
 
 判定依据：本工具按**芯片家族**路由（同一家族共用同一 Booter/payload 资产，
 与上游 `ad102_family()`/GA10x 路由一致）。层级含义：
-✅ 实测验证（本机跑通全链+payload）；🟢 上游硅验证（同家族在 kmod 侧已验证，
+✅ 实测验证（本机或注明来源的社区实机跑通全链+payload）；🟢 上游硅验证（同家族在 kmod 侧已验证，
 本 EFI 路径同构，预期兼容）；🟡 路径存在未验证（代码就绪，无硅证据）；
 ❌ 不兼容。
 
@@ -322,13 +324,13 @@ Blackwell（0x2bxx+）不在范围。
 | AD107 | 4050 Laptop **28a1** | ✅ 实测（2026-10-26，v0.1.3）：全链通过（WPR2 验证→booter marker→四写→选择器→签名还原→FLR 后 AON 存活）；FP16 tensor **22 → 38-42 TFLOPS（1.7-1.9×）**，完整性自检绿。门控值 `0xbadf1301` 走容毒回退 |
 | AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ 实测**（PR #5，AD106 桌面：回放 + 解锁 + 四写读回，FP16 46.78→75.28 TFLOPS）；**2805 ✅ 实测**（[报告](docs/evidence/ad106-2805-nuc13/report.md)：ASUS `1043:8921` + Intel NUC13RNGi9，全链读回，FP16 45.78→75.24 TFLOPS，ComfyUI 稠密 bf16 ×1.57） |
 | AD106 | 4070 Laptop **2820**（魔改卡同 ID） | 🟡 路由已加（2026-10-28）：同 AD106 家族资产、与 2803 同 die 家族（上游表同样缺此 ID）。首次实机请按下文"不兼容/异常时"提交 `\loader.log` 全文，验证后再升级层级；**魔改卡另请附原卡型号与 VBIOS 版本** |
-| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | 🟢 上游硅验证 |
+| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | **2783 ✅ 社区实测**（[issue #3](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/3)，v0.1.4，Palit RTX 4070 SUPER + MSI B760 TOMAHAWK WIFI，220 W）：回放、解锁读回及 FLR 存活通过；8192 GEMM FP16 70.5→100.1、BF16 71.0→107.0 TFLOPS。其余列出的 ID 保留上游证据层级 |
 | AD103 | 4080S 2702 / 4080 2704 / 4070TiS 2705 / **4070 2709** / 4090M 2757 | **2709 ✅ 实测**（[issue #8](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/8)，B760 台式独显直连：四写全链读回、选择器穿 FLR；OS 侧 sm_89 mma 微基准 FP16 ~61→**123.91**、BF16 **118.90**、FP8 **243.55** TFLOPS，均 **2.0×**）；其余 🟢 上游硅验证 |
 | AD102 | 4090 2684 / 4090D 2685 / 4070TiS 2689 | 🟢 上游硅验证 |
-| GA10x | 3090/3080 2204/2206、3070 系 2484–248c、3060 系 2501–2584 等（0x22xx/0x24xx/0x25xx 全段放行；原 20c2/20f1 系 GA100 类已剔除） | **3060 Ti LHR 2489 ✅ 实测**（[issue #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11)，2026-10-28，v2.1.0，@hunan-NRT）：GA102 资产 V67 链 wait_plm 判据通过（PLM 0xffffff8f→0xffffffff 翻转读回，~149 ms；SS0/SS1 写入读回 0x88888888/0x8、FEAT_READOUT_1=0）→ 交棒 Windows 正常；**AMD 平台**（B450M 迫击炮 + 5700X3D）；卡刷映众冰龙 3060 Ti VBIOS（跨 VBIOS 不影响，FWSEC PROM 读取正常）。其余 GA10x 🟡 上游 kmod 验证，本 EFI 路径暂无更多硅证据（成功判据修复溯源见 [issue #6](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6)） |
-| **TU106** | **RTX 2070 1f07 / 2060 Super 1f06** | **1f07 ✅ 实测**（2026-10-27，v0.2.0）：全链通过（FWSEC 点火 → BOOT_DIRECT booter → V67 起爆 → PLM 0x409650 全开 → SS0/SS1 写入读回 → 签名还原）；**FP32 累加 36 → 60–63 TFLOPS（+67~75%）**。**前置：Windows 侧 GSP 固件模式（见下节），必须重启生效**。实测机：Intel 10980HK ES（QTJ1）+ 2070 混合输出台式平台；**休眠恢复后进 U 盘写入解锁 → Windows 验证通过**。**1f06 ✅ 实测**（[issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12)，2026-10-27，v0.2.0，@vadash）：全链通过（FWSEC → WPR2 验证 → BOOT_DIRECT booter → PLM 全开 → SS0/SS1 写入读回 0x88888888/0x8 → 签名还原 → PLM relock 后解锁值持续 → FLR 按语义跳过）→ 交棒 Windows 正常；**AMD 平台**（AM4/Promontory，桥 BME 修复路径实测覆盖）；8 GB SKU 与 2070 共用 8192 MiB 几何表（其他容量 TU106 SKU 需扩表后才可跑） |
+| GA10x | 3090/3080 2204/2206、3070 系 2484–248c、3060 系 2501–2584 等（0x22xx/0x24xx/0x25xx 全段放行；原 20c2/20f1 系 GA100 类已剔除） | **3060 Ti LHR 2489 ✅ 实测**（[issue #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11)，2026-10-28，v2.1.0，@hunan-NRT）：GA102 资产 V67 链 wait_plm 判据通过（PLM 0xffffff8f→0xffffffff 翻转读回，~149 ms；SS0/SS1 写入读回 0x88888888/0x8、FEAT_READOUT_1=0）→ 交棒 Windows 正常；**AMD 平台**（B450M 迫击炮 + 5700X3D）；卡刷映众冰龙 3060 Ti VBIOS（跨 VBIOS 不影响，FWSEC PROM 读取正常）。另有 **2206 / 249d / 2420 ✅ 社区 EFI 实测**（v2.1.0；[结果与平台限制](docs/community-reports.md)）。其余同族卡保留兼容结论，以上为已逐项归档的 EFI 实测（成功判据修复溯源见 [issue #6](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6)） |
+| **TU106** | **RTX 2070 1f07 / 2060 Super 1f06** | **1f07 ✅ 实测**（2026-10-27，v0.2.0）：全链通过（FWSEC 点火 → BOOT_DIRECT booter → V67 执行 → PLM 0x409650 全开 → SS0/SS1 写入读回 → 签名还原）；**FP32 累加 36 → 60–63 TFLOPS（+67~75%）**。**前置：Windows 侧 GSP 固件模式（见下节），必须重启生效**。实测机：Intel 10980HK ES（QTJ1）+ 2070 混合输出台式平台；**休眠恢复后进 U 盘写入解锁 → Windows 验证通过**。**1f06 ✅ 实测**（[issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12)，2026-10-27，v0.2.0，@vadash）：全链通过（FWSEC → WPR2 验证 → BOOT_DIRECT booter → PLM 全开 → SS0/SS1 写入读回 0x88888888/0x8 → 签名还原 → PLM relock 后解锁值持续 → FLR 按语义跳过）→ 交棒 Windows 正常；**AMD 平台**（AM4/Promontory，桥 BME 修复路径实测覆盖）；8 GB SKU 与 2070 共用 8192 MiB 几何表（其他容量 TU106 SKU 需扩表后才可跑） |
 | TU102/TU104/TU116（20 系其余/16 系） | 1e02–1fff、2182–21d1 等 | 🟢 同族资产+社区硅验证（2080Ti 22G chenxluo +51~75%、2080Ti 11G nlzy/haohervchb ~1.6×，同链同构） |
-| Turing 及更早（Pascal…） | — | ❌ 无事务轨 |
+| Turing 之前（Pascal…） | — | ❌ 无事务轨 |
 | Blackwell (50 系) / GA100 | — | ❌ 链路不同，不在范围 |
 
 ## Turing（20 系）专属：GSP 固件模式前置（必读）
@@ -374,7 +376,7 @@ TU106 出厂钳制实测：SS0 冷值非默认（0x15000/0x11000/0x0 引导间
 
 **不兼容/异常时**：请提交 U 盘根的 `\loader.log` 全文到
 [Issues](https://github.com/physicsdolphin/nv-uefi-unlocker/issues)（日志含
-完整阶段轨迹，是我们诊断的唯一依据；发前可脱敏机器信息）。也可以在
+完整阶段轨迹，可与系统侧状态和测量结果一起用于诊断；发前可脱敏机器信息）。也可以在
 [Discussions](https://github.com/physicsdolphin/nv-uefi-unlocker/discussions)
 分享成功/失败数据点（卡型号 + 关键日志行 + 判据值），帮助扩展矩阵。
 
@@ -432,6 +434,8 @@ docs/      报告、里程碑证据（evidence-as-commits）、寄存器冷值�
 
 ## 安全宪法（副本，与 AGENTS.md §1 等义，违反任何一条即停工）
 
+以下是项目约束。当前 loader 记录 PROM CRC32 指纹，尚未实现逐卡 ROM/PROM SHA-256 拒绝门；详见[实现边界](docs/community-reports.md#使用说明与实现边界)。约束仍然有效，不应据此误认所有门控均已实现。
+
 1. **读回是唯一成功判据**。状态码/返回值/中断/自检输出一律不构成执行证明。
 2. **STOP/异常后同会话绝不重试**；完全断电后走正常 Windows 引导恢复。
 3. 只读链式加载 ESP 的 `\EFI\Microsoft\Boot\bootmgfw.efi`，**永不覆写 ESP
@@ -467,7 +471,7 @@ Windows 引导 → 检查设备管理器/事件日志驱动状态 → 记录证�
 cargo build --release   # 宿主侧 crate（assets/sim）——loader 不在 default-members
 cargo efi               # EFI 只读构建（M0/M1 诊断模式）
 cargo efi-tx            # gated 事务构建（含写路径；仅显式需要时使用）
-cargo xt                # 全部宿主测试（assets 19 + sim 44）
+cargo xt                # 全部宿主测试（assets + sim；数量以当前输出为准）
 ```
 
 裸 `cargo build --workspace` 会以宿主三元组构建 loader 并报错——loader 只能
