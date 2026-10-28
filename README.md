@@ -7,7 +7,8 @@ UEFI DXE 时窗执行完整固件事务：SEC2 scrubber → FWSEC-FRTS（WPR2）
 Booter 启动 GSP-RM →（门控后）V67 四写 payload → 读回验证 → FLR → 链式交回
 Windows Boot Manager。
 
-**当前状态：40 系（AD10x）+ 20 系（TU10x）双轨闭环。** 支持矩阵：
+**当前状态：40 系（AD10x）+ 30 系（GA10x）+ 20 系（TU10x）三轨闭环——
+v2.1.0 起 30 系全系兼容。** 支持矩阵：
 
 - **RTX 20 系（Turing）✅ 实测支持（v0.2.0）**——RTX 2070（TU106, `10de:1f07`）
   全链解锁：**FP32 累加 GEMM 36 → 60–63 TFLOPS（+67~75%）**；2060 Super
@@ -15,12 +16,19 @@ Windows Boot Manager。
   **Turing 用户
   必须先运行 [GSP 固件模式脚本](#turing20-系专属gsp-固件模式前置必读)并重启**，
   详见下方 Turing 专属节。
+- **RTX 30 系（Ampere/GA10x）✅ 全系兼容（v2.1.0）**——2026-10-28 起 GA10x
+  设备 ID 全段放行（0x22xx/0x24xx/0x25xx），**30 系全兼容**。实证：RTX
+  3060 Ti LHR（GA104, `10de:2489`）v2.1.0 解锁成功（[issue
+  #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11)：
+  wait_plm 判据 PLM 翻转 + SS0/SS1 读回全对，AMD 平台 + 刷过跨厂 VBIOS
+  均通过）；同链在上游社区工具已覆盖 3060（2487，+58~85%）。**30 系用户
+  无需** Turing 的 GSP 固件模式前置。
 - **RTX 40 系（Ada）✅ 实测支持**——RTX 4060 Laptop（`10de:28e0`，AD107M）
   四写解锁双端验证：固件侧 marker `0x67b00001` + 四 PLM 读回，Windows 侧
   FP16 GEMM 29.89 → 49.33 TFLOPS（1.65×）。完整报告见
   [docs/ada28e0-uefi-report.md](docs/ada28e0-uefi-report.md)。
 
-两代机制差异见 [兼容性矩阵](#兼容性矩阵)（Turing 的 FEAT 块在 0x4096xx、
+三代机制差异见 [兼容性矩阵](#兼容性矩阵)（Turing 的 FEAT 块在 0x4096xx、
 FLR 会重锁 PLM、Windows 驱动需 GSP 模式——均与 Ada 不同）。
 
 ## 使用（RTX 40 系笔记本/台式，AD10x 家族）

@@ -8,8 +8,9 @@ firmware transaction: SEC2 scrubber → FWSEC-FRTS (WPR2) → signed Booter
 booting GSP-RM → (gated) V67 four-write payload → read-back verification
 → FLR → chained handoff back to the Windows Boot Manager.
 
-**Current status: both the 40-series (AD10x) and 20-series (TU10x) tracks
-are closed end to end.** Support matrix:
+**Current status: three tracks closed end to end — 40-series (AD10x),
+30-series (GA10x) and 20-series (TU10x); the 30 series is fully
+compatible as of v2.1.0.** Support matrix:
 
 - **RTX 20 series (Turing) ✅ verified (v0.2.0)** — RTX 2070 (TU106,
   `10de:1f07`) full-chain unlock: **FP32-accum GEMM 36 → 60-63 TFLOPS
@@ -18,13 +19,23 @@ are closed end to end.** Support matrix:
   **Turing users must first run the [GSP firmware-mode
   script](#turing-20-series-prerequisite-gsp-firmware-mode-must-read) and
   RESTART** — see the Turing section below.
+- **RTX 30 series (Ampere/GA10x) ✅ fully compatible (v2.1.0)** — since
+  2026-10-28 the GA10x device-ID ranges (0x22xx/0x24xx/0x25xx) are fully
+  routed: **the 30 series is fully compatible**. Evidence: RTX 3060 Ti
+  LHR (GA104, `10de:2489`) unlocked with v2.1.0 ([issue
+  #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11):
+  wait_plm verdict, PLM flip + SS0/SS1 read-backs all correct; passed on
+  an AMD platform with a flashed cross-vendor VBIOS); the same chain is
+  upstream-verified across the family (3060 / 2487, +58-85% with
+  community tools). **30-series users do NOT need** the Turing
+  GSP firmware-mode prerequisite.
 - **RTX 40 series (Ada) ✅ verified** — RTX 4060 Laptop (`10de:28e0`,
   AD107M) four-write unlock, verified on both sides: firmware marker
   `0x67b00001` + the four PLM read-backs; Windows-side FP16 GEMM 29.89 →
   49.33 TFLOPS (1.65×). Full report:
   [docs/ada28e0-uefi-report.md](docs/ada28e0-uefi-report.md).
 
-The mechanical differences between the two generations are in the
+The mechanical differences between the three generations are in the
 [compatibility matrix](#compatibility-matrix) (Turing's FEAT block lives
 at 0x4096xx, FLR re-locks the PLMs, and the Windows driver requires GSP
 mode — all different from Ada).
