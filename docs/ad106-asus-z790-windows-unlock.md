@@ -34,6 +34,26 @@ Method: `bench/bench_gemm.py` — `torch.mm` on contiguous `randn` inputs, reduc
 5 warm-up + 20 timed iterations, median, two passes; clock/power sampled under load. PyTorch 2.11.0+cu128,
 NVIDIA driver 581.42, Windows 10 Pro 19045. Raw JSON for every run: `evidence/ad106-asus-z790/bench/`.
 
+### FP8 and per-clock results (2026-10-28, v2.1.4 + PR #26)
+
+FP8 (e4m3, `torch._scaled_mm`, FP32 accumulate) is gated by the same selectors. Matched pair, same 216 W + curve
+profile: **93.50 → 148.71 TFLOPS (+59 %)**; FP16/BF16/TF32 reproduce the numbers above (+70 % / +74 % / +70 %).
+
+Per-clock, with the power limit taken out of the picture (`nvidia-smi -lgc 2100,2100` in both states, no power-cap events):
+
+| TFLOPS @ 2100 MHz | Stock | Unlocked | Per-clock gain |
+|---|---:|---:|---:|
+| FP16 8192³ | 35.96 | 70.72 | 1.97× |
+| BF16 8192³ | 35.94 | 70.43 | 1.96× |
+| FP8 e4m3 8192³ (FP32 out) | 69.97 | 131.50 | 1.88× |
+| TF32 4096³ | 17.24 | 33.00 | 1.91× |
+| FP32 4096³ (control) | 11.18 | 11.18 | 1.00× |
+
+FP8's lower ratio is mostly output traffic on the 128-bit bus, not the unlock: unlocked at 2100 MHz, FP8 goes 131.5
+(8192³, FP32 out) → 133.4 (BF16 out) → 136.3 TFLOPS (16384³, BF16 out), 1.95× the stock 8192³ figure. Correctness is
+unchanged in every state (max relative error vs FP64: FP8 ~2e-4 on the same quantised inputs, FP16 3e-4, BF16 2e-3).
+Data, logs and chart: `evidence/ad106-asus-z790/fp8-perclock/`. `bench_gemm.py` now includes FP8 and its correctness check.
+
 ## Hardware
 
 | | |

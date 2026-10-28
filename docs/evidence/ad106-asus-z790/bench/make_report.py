@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-CASES = [("FP16", 8192), ("BF16", 8192), ("TF32", 4096), ("FP32 (control)", 4096)]
+CASES = [("FP16", 8192), ("BF16", 8192), ("FP8 e4m3", 8192), ("TF32", 4096), ("FP32 (control)", 4096)]
 COLORS = ["#3987e5", "#d95926", "#199e70"]  # validated dark categorical slots 1-3
 CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 HERE = Path(__file__).parent

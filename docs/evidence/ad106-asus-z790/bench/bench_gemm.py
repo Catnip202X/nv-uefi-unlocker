@@ -30,19 +30,34 @@ def smi(query):
     return out.stdout.strip()
 
 
-def gemm_tflops(n, dtype, tf32=False):
+FP8 = torch.float8_e4m3fn
+
+
+def make_op(n, dtype, tf32=False):
+    """One GEMM of this case as a closure. FP8 goes through cuBLASLt via
+    _scaled_mm (B column-major, unit scales, FP32 output = FP32 accumulate)."""
     torch.backends.cuda.matmul.allow_tf32 = tf32
+    if dtype is FP8:
+        a = torch.randn(n, n, device="cuda").to(FP8)
+        b = torch.randn(n, n, device="cuda").to(FP8).t()
+        one = torch.tensor(1.0, device="cuda")
+        return lambda: torch._scaled_mm(a, b, scale_a=one, scale_b=one, out_dtype=torch.float32)
     a = torch.randn(n, n, device="cuda", dtype=dtype)
     b = torch.randn(n, n, device="cuda", dtype=dtype)
+    return lambda: torch.mm(a, b)
+
+
+def gemm_tflops(n, dtype, tf32=False):
+    op = make_op(n, dtype, tf32)
     for _ in range(WARMUP):
-        torch.mm(a, b)
+        op()
     torch.cuda.synchronize()
     times = []
     for _ in range(TIMED):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        torch.mm(a, b)
+        op()
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end) / 1000.0)
@@ -60,6 +75,14 @@ def correctness():
         got = torch.mm(a, b).double()
         ref = torch.mm(a.double(), b.double())
         worst[name] = ((got - ref).abs().max() / ref.abs().max()).item()
+    # FP8: compare against FP64 on the SAME already-quantised e4m3 inputs, so
+    # only the GEMM's accumulation is measured, not the e4m3 rounding.
+    a8 = torch.randn(2048, 2048, device="cuda").to(FP8)
+    b8 = torch.randn(2048, 2048, device="cuda").to(FP8)
+    one = torch.tensor(1.0, device="cuda")
+    got = torch._scaled_mm(a8, b8.t().contiguous().t(), scale_a=one, scale_b=one, out_dtype=torch.float32).double()
+    ref = torch.mm(a8.double(), b8.double())
+    worst["fp8"] = ((got - ref).abs().max() / ref.abs().max()).item()
     return worst
 
 
@@ -77,6 +100,7 @@ def main():
         ("FP16", 8192, torch.float16, False),
         ("BF16", 4096, torch.bfloat16, False),
         ("BF16", 8192, torch.bfloat16, False),
+        ("FP8 e4m3", 8192, FP8, False),
     ]
     result = {
         "label": label,
@@ -96,10 +120,9 @@ def main():
             row = {"case": name, "n": n, "pass": p, "median": round(med, 2), "min": round(lo, 2), "max": round(hi, 2)}
             # Sample under load: keep this case's GEMM running until the
             # nvidia-smi process (slow to start) has returned its reading.
-            torch.backends.cuda.matmul.allow_tf32 = tf32
-            a = torch.randn(n, n, device="cuda", dtype=dtype)
+            op = make_op(n, dtype, tf32)
             for _ in range(5):
-                torch.mm(a, a)
+                op()
             torch.cuda.synchronize()
             proc = subprocess.Popen(
                 ["nvidia-smi", "--query-gpu=clocks.sm,power.draw,clocks_event_reasons.sw_power_cap",
@@ -107,7 +130,7 @@ def main():
                 stdout=subprocess.PIPE, text=True,
             )
             while proc.poll() is None:
-                torch.mm(a, a)
+                op()
                 torch.cuda.synchronize()
             clock, power, cap = proc.stdout.read().strip().split(", ")
             row["clock_mhz"], row["power_w"], row["power_capped"] = clock, power, cap == "Active"
