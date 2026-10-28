@@ -796,6 +796,15 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
         Ok(info) => info.file_size() as usize,
         Err(e) => { info!("TX-ASSET-DIAG: {path} get_info failed {:?}", e.status()); return None; }
     };
+    // A FAT entry that reports garbage (0 or absurd) must fail here instead of
+    // aborting the allocator with a capacity the firmware cannot serve, and a
+    // short read must fail instead of handing a truncated image to the DMA
+    // copies (only V67 and the stock signature are length-checked downstream).
+    const MAX_ASSET_BYTES: usize = 192 << 20;
+    if size == 0 || size > MAX_ASSET_BYTES {
+        info!("TX-ASSET-DIAG: {path} size {size} outside 1..={MAX_ASSET_BYTES} - refusing");
+        return None;
+    }
     let mut out = Vec::with_capacity(size);
     unsafe { out.set_len(0); }
     let mut chunk = [0u8; 65536];
@@ -807,6 +816,10 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
             Ok(n) => { out.extend_from_slice(&chunk[..n]); got += n; }
             Err(e) => { info!("TX-ASSET-DIAG: {path} read err at {got}/{size}: {:?}", e.status()); return None; }
         }
+    }
+    if got != size {
+        info!("TX-ASSET-DIAG: {path} short read {got}/{size} - refusing (damaged stick or pulled media)");
+        return None;
     }
     info!("TX-ASSET-DIAG: {path} loaded {}/{} bytes", out.len(), size);
     Some(out)

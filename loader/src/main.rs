@@ -244,6 +244,14 @@ fn tx_one_card(g: &pci::FoundGpu) {
             info!("TX: aborted on warm/resume entry before any GPU write - chain-loading unchanged Windows (use a Restart or cold boot)");
             tx::handoff_out(&pci);
         }
+        // The cold-state guard refused: WPR2 was already initialized this
+        // power cycle, so no GPU register was written (claim_guards runs ahead
+        // of the first write). There is nothing to unwind, and an FLR here
+        // would only disturb a card the OS driver legitimately owns.
+        Err(tx::TxError::EBusy) => {
+            info!("TX: refused (EBUSY: WPR2 already initialized this power cycle) - no GPU register was written, no FLR");
+            tx::handoff_out(&pci);
+        }
         Err(e) => {
             info!("TX: transaction failed: {e:?} - NOT retrying this session");
             // Failure unwind: FLR wipes our half-states (engine resets, BCR,
