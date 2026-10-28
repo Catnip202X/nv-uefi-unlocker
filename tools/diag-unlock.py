@@ -107,23 +107,37 @@ class Bar0:
 
 
 def family_of(boot0):
-    # die = bits [31:20]; nvchip series per open-gpu-kernel-modules nv_arch.h
-    # (GP104=NV124, GA102F=NV17F, AD107=NV197 - field-confirmed on 1f07/AD106)
+    # die = bits [31:20]; nvchip series per nv_arch.h GPU_ARCHITECTURE table
+    # (MAXWELL=0x110 PASCAL=0x130 VOLTA=0x140 TURING=0x160 AMPERE=0x170
+    #  HOPPER=0x180 ADA=0x190 GB1XX=0x1A0 GB2XX=0x1B0 RUBIN=0x1C0)
+    # field anchors: TU106=0x166 AD106=0x196 AD107=0x197 GA100=0x170 GA106=0xb76
     die = (boot0 >> 20) & 0xFFF
+    if 0x110 <= die <= 0x11F:
+        return "maxwell", None
     if 0x120 <= die <= 0x12F:
+        return "maxwell2", None
+    if 0x130 <= die <= 0x13F:  # GP104=0x134 GP106=0x136
         return "pascal", None
-    if 0x130 <= die <= 0x13F:
+    if 0x140 <= die <= 0x14F:  # GV100=0x140
         return "volta", None
+    if 0x150 <= die <= 0x15F:
+        return "volta2", None
     if 0x160 <= die <= 0x16F:
         return "turing", TURING
     if 0x170 <= die <= 0x17F:  # GA100 reads 0x170000a1 plainly
         return "ampere", GAADA
-    if 0xB70 <= die <= 0xB7F:  # GA10x quirk: 0xb7xx00a1 (GA102=b74, GA106=b76)
-        return "ampere", GAADA
+    if 0x180 <= die <= 0x18F:  # GH100=0x180
+        return "hopper", None
     if 0x190 <= die <= 0x19F:  # Ada is NV19x, NOT 0x22x (device ids)
         return "ada", GAADA
-    if 0x090 <= die <= 0x09F or 0x1A0 <= die <= 0x1AF:
-        return "hopper/blackwell", None
+    if 0x1A0 <= die <= 0x1AF:  # GB102=0x1A2
+        return "blackwell-gb1", None
+    if 0x1B0 <= die <= 0x1BF:  # GB202-class (50-series)
+        return "blackwell-gb2", None
+    if 0x1C0 <= die <= 0x1CF:
+        return "rubin", None
+    if 0xB70 <= die <= 0xB7F:  # GA10x quirk: 0xb7xx00a1 (GA102=b74, GA106=b76)
+        return "ampere", GAADA
     return None, None
 
 

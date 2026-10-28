@@ -96,6 +96,8 @@ mod win {
         ) -> i32;
         pub fn CloseHandle(h: Handle) -> i32;
         pub fn GetLastError() -> u32;
+        pub fn LoadLibraryW(name: *const u16) -> Handle;
+        pub fn GetProcAddress(h: Handle, name: *const u8) -> *const c_void;
     }
 
     #[repr(C)]
@@ -127,6 +129,99 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn last_err() -> u32 {
     unsafe { win::GetLastError() }
+}
+
+// ---------------------------------------------------------------- NVAPI GC6 wake
+// Hybrid-laptop idle parks the dGPU in GC6/GCOFF (RTD3): BARs stop decoding
+// and every read degenerates. GC6 exit is a DRIVER-mediated firmware sequence
+// (link wake, VRAM retrain, context restore) - a raw PMCSR flip cannot do it.
+// The lightweight path is the driver's own control: NvAPI_GPU_GC6Control
+// (NDA 0xD387D414; nvoc nvapi-rs reverse - cmd 0=query/1=sleep/2=wake, state
+// GC6_IDLE=2 / D0_ACTIVE=3, struct v1 12 bytes, version word 0x1000C).
+mod nvapi_wake {
+    use super::win;
+    use std::ffi::c_void;
+
+    const NVAPI_OK: i32 = 0;
+    const GC6_VERSION_V1: u32 = 0x0001_000C; // ver 1, 12-byte struct
+    const GC6_CMD_QUERY: u32 = 0;
+    const GC6_CMD_WAKE: u32 = 2;
+    const GC6_STATE_D0_ACTIVE: u32 = 3;
+
+    type QueryInterfaceFn = unsafe extern "system" fn(u32) -> *mut c_void;
+    type InitializeFn = unsafe extern "system" fn() -> i32;
+    type EnumFn = unsafe extern "system" fn(*mut u32, *mut u32) -> i32;
+    type Gc6Fn = unsafe extern "system" fn(u32, *mut c_void) -> i32;
+
+    /// Wake every physical GPU out of GC6. Returns a human summary; errors
+    /// mean nvapi.dll is unusable (driver not installed) - callers degrade
+    /// gracefully.
+    pub fn wake_all() -> Result<String, String> {
+        unsafe {
+            let name: Vec<u16> = "nvapi.dll".encode_utf16().chain([0]).collect();
+            let lib = win::LoadLibraryW(name.as_ptr());
+            if lib.is_null() {
+                return Err("nvapi.dll not loadable - NVIDIA driver installed?".into());
+            }
+            let qip = win::GetProcAddress(lib, b"nvapi_QueryInterface\0".as_ptr());
+            if qip.is_null() {
+                return Err("nvapi_QueryInterface missing".into());
+            }
+            let qi: QueryInterfaceFn = std::mem::transmute(qip);
+            let init: InitializeFn = std::mem::transmute(qi(0x0150_E828));
+            let st = init();
+            if st != NVAPI_OK {
+                return Err(format!("NvAPI_Initialize failed ({st:#x})"));
+            }
+            let enumf: EnumFn = std::mem::transmute(qi(0xE5AC_921F));
+            let mut handles = [0u32; 64];
+            let mut count = 0u32;
+            if enumf(handles.as_mut_ptr(), &mut count) != NVAPI_OK {
+                return Err("NvAPI_EnumPhysicalGPUs failed".into());
+            }
+            let gc6: Gc6Fn = std::mem::transmute(qi(0xD387_D414));
+
+            let mut report = String::new();
+            for &h in &handles[..count.min(64) as usize] {
+                let mut d = [0u32; 3];
+                d[0] = GC6_VERSION_V1;
+                d[1] = GC6_CMD_QUERY;
+                if gc6(h, d.as_mut_ptr().cast()) != NVAPI_OK {
+                    continue; // desktop GPU / no RTD3 support: nothing to wake
+                }
+                match d[2] {
+                    GC6_STATE_D0_ACTIVE => report.push_str(&format!("gpu{h}: D0; ")),
+                    2 => {
+                        // parked in GC6 - force-wake and poll the exit
+                        d[1] = GC6_CMD_WAKE;
+                        if gc6(h, d.as_mut_ptr().cast()) != NVAPI_OK {
+                            report.push_str(&format!("gpu{h}: wake-call failed; "));
+                            continue;
+                        }
+                        let mut woken = false;
+                        for _ in 0..10 {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            let mut q = [0u32; 3];
+                            q[0] = GC6_VERSION_V1;
+                            q[1] = GC6_CMD_QUERY;
+                            if gc6(h, q.as_mut_ptr().cast()) == NVAPI_OK
+                                && q[2] == GC6_STATE_D0_ACTIVE
+                            {
+                                woken = true;
+                                break;
+                            }
+                        }
+                        report.push_str(&format!(
+                            "gpu{h}: GC6 -> {}; ",
+                            if woken { "D0" } else { "wake timeout" }
+                        ));
+                    }
+                    s => report.push_str(&format!("gpu{h}: state {s}; ")),
+                }
+            }
+            Ok(report)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- pmxdrv transport
@@ -520,27 +615,51 @@ fn badf_bucket(v: u32) -> Option<&'static str> {
 /// Die id = PMC_BOOT_0 bits [31:20]; nvchip series per open-gpu-kernel-modules
 /// nv_arch.h implementation numbers (GP104=NV124, GA102F=NV17F, AD107=NV197 -
 /// the latter two confirmed against 1f07/AD106/AD107 field reads).
+/// Die id = PMC_BOOT_0 bits [31:20]; nvchip series per open-gpu-kernel-modules
+/// nv_arch.h GPU_ARCHITECTURE table (MAXWELL=0x110, MAXWELL2=0x120, PASCAL=0x130,
+/// VOLTA=0x140, VOLTA2=0x150, TURING=0x160, AMPERE=0x170, HOPPER=0x180,
+/// ADA=0x190, GB1XX=0x1A0, GB2XX=0x1B0, RUBIN=0x1C0) + implementation numbers
+/// (GP104=4, GA102F=F, AD107=7). Field anchors: TU106 0x166, AD106 0x196,
+/// AD107 0x197, GA100 0x170, GA106 0xb76 (GA10x quirk).
 fn family_of(boot0: u32) -> Option<(&'static str, &'static [(&'static str, u32)])> {
     let die = (boot0 >> 20) & 0xFFF;
-    if (0x120..=0x12F).contains(&die) {
-        Some(("pascal", &FEAT_NONE))
+    if (0x110..=0x11F).contains(&die) {
+        // GM200=0x110 GM204=0x114 GM206=0x116 GM107=0x117 GM108=0x118
+        Some(("maxwell", &FEAT_NONE))
+    } else if (0x120..=0x12F).contains(&die) {
+        Some(("maxwell2", &FEAT_NONE))
     } else if (0x130..=0x13F).contains(&die) {
+        // GP100=0x130 GP102=0x132 GP104=0x134 GP106=0x136 GP107=0x137 GP108=0x138
+        Some(("pascal", &FEAT_NONE))
+    } else if (0x140..=0x14F).contains(&die) {
+        // GV100=0x140 GV11B=0x14B
         Some(("volta", &FEAT_NONE))
+    } else if (0x150..=0x15F).contains(&die) {
+        Some(("volta2", &FEAT_NONE))
     } else if (0x160..=0x16F).contains(&die) {
         Some(("turing", &FEAT_TURING))
     } else if (0x170..=0x17F).contains(&die) {
         // GA100 reads 0x170000a1 plainly (cmp170hx register-reference)
         Some(("ampere", &FEAT_AMPADA))
+    } else if (0x180..=0x18F).contains(&die) {
+        // GH100=0x180
+        Some(("hopper", &FEAT_NONE))
+    } else if (0x190..=0x19F).contains(&die) {
+        // Ada is NV19x (AD106 field read 0x196000a1) - NOT 0x22x (device ids)
+        Some(("ada", &FEAT_AMPADA))
+    } else if (0x1A0..=0x1AF).contains(&die) {
+        // GB100=0x1A0 GB102=0x1A2
+        Some(("blackwell-gb1", &FEAT_NONE))
+    } else if (0x1B0..=0x1BF).contains(&die) {
+        // GB202-class (50-series)
+        Some(("blackwell-gb2", &FEAT_NONE))
+    } else if (0x1C0..=0x1CF).contains(&die) {
+        Some(("rubin", &FEAT_NONE))
     } else if (0xB70..=0xB7F).contains(&die) {
         // GA10x BOOT_0 quirk: 0xb7xx00a1 (GA102=0xb74, GA106=0xb76 field-
         // confirmed 2026-10-28; the "0xb74000a1" note in cmp170hx
         // register-reference is exactly this). GA100 does NOT do this.
         Some(("ampere", &FEAT_AMPADA))
-    } else if (0x190..=0x19F).contains(&die) {
-        // Ada is NV19x (AD106 field read 0x196000a1) - NOT 0x22x (device ids)
-        Some(("ada", &FEAT_AMPADA))
-    } else if (0x090..=0x09F).contains(&die) || (0x1A0..=0x1AF).contains(&die) {
-        Some(("hopper/blackwell", &FEAT_NONE))
     } else {
         None
     }
@@ -756,53 +875,16 @@ fn run() -> i32 {
         for (a, b) in &g.ranges {
             println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
         }
-        // walk candidates smallest-size first; the PMC sanity read arbitrates.
-        // A non-degenerate BOOT_0 on an unknown die still wins the walk as a
-        // fallback (diagnosis-only) - the die table must not veto a card.
-        let mut picked: Option<(u64, u64, u32)> = None; // (bar0, va, boot0)
-        for bar0 in g.bar0_candidates() {
-            const PAGES: u32 = 4096; // 16 MiB BAR0
-            let va = match drv.map_physical(bar0, PAGES) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("map BAR0@{bar0:#x} failed: {e}");
-                    rc = 1;
-                    continue;
-                }
-            };
-            let boot0 =
-                unsafe { ((va as *const u8).add(0) as *const u32).read_volatile() };
-            if boot0 == 0xFFFF_FFFF || boot0 == 0 {
-                // BAR decodes but reads degenerate: device likely D3 / MEM
-                // decode off / driver unbound. Keep as last-resort evidence.
-                if picked.is_none() {
-                    picked = Some((bar0, va, boot0));
-                } else {
-                    drv.unmap_physical(va);
-                }
-                continue;
+        let mut picked = walk_candidates(&drv, g);
+        // degenerate reads (GC6/GCOFF park, D3, MEM decode off) -> one NVAPI
+        // driver-mediated wake, then a single re-walk
+        if picked.as_ref().map_or(true, |(_, _, b)| *b == 0 || *b == 0xFFFF_FFFF) {
+            match nvapi_wake::wake_all() {
+                Ok(r) if !r.is_empty() => println!("NVAPI GC6 wake: {r}"),
+                Ok(_) => println!("NVAPI GC6 wake: all GPUs already D0"),
+                Err(e) => println!("NVAPI wake unavailable: {e}"),
             }
-            match family_of(boot0) {
-                Some(_) => {
-                    if let Some((_, old_va, _)) = picked {
-                        drv.unmap_physical(old_va);
-                    }
-                    picked = Some((bar0, va, boot0));
-                    break;
-                }
-                None => {
-                    // unknown NVIDIA-class die: remember the first, keep
-                    // looking for a known one
-                    if let Some((_, old_va, old_b)) = picked {
-                        if old_b != 0 && old_b != 0xFFFF_FFFF {
-                            drv.unmap_physical(va);
-                            continue;
-                        }
-                        drv.unmap_physical(old_va);
-                    }
-                    picked = Some((bar0, va, boot0));
-                }
-            }
+            picked = walk_candidates(&drv, g);
         }
         let Some((bar0, va, boot0)) = picked else {
             println!("no candidate range decoded as an NVIDIA PMC - card skipped");
@@ -814,7 +896,7 @@ fn run() -> i32 {
         if boot0 == 0xFFFF_FFFF || boot0 == 0 {
             drv.unmap_physical(va);
             println!(
-                "BAR0 reads {} - device likely D3 / MEM decode disabled / driver unbound; nothing to diagnose",
+                "BAR0 reads {} - still degenerate after GC6 wake attempt: device D3 / MEM decode off / driver unbound; nothing to diagnose",
                 if boot0 == 0 { "all zeros" } else { "all ones" }
             );
             rc = 1;
@@ -873,4 +955,51 @@ fn run() -> i32 {
         drv.unmap_physical(va);
     }
     rc
+}
+
+/// Walk the card's BAR0 candidates smallest-size first; the PMC sanity read
+/// arbitrates. A non-degenerate BOOT_0 on an unknown die still wins as a
+/// fallback (diagnosis-only) - the die table must not veto a card. A
+/// degenerate pick (all-0/all-1) is remembered only as a last resort.
+fn walk_candidates(drv: &PmxDrv, g: &Gpu) -> Option<(u64, u64, u32)> {
+    let mut picked: Option<(u64, u64, u32)> = None; // (bar0, va, boot0)
+    for bar0 in g.bar0_candidates() {
+        const PAGES: u32 = 4096; // 16 MiB BAR0
+        let va = match drv.map_physical(bar0, PAGES) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("map BAR0@{bar0:#x} failed: {e}");
+                continue;
+            }
+        };
+        let boot0 = unsafe { ((va as *const u8).add(0) as *const u32).read_volatile() };
+        if boot0 == 0xFFFF_FFFF || boot0 == 0 {
+            if picked.is_none() {
+                picked = Some((bar0, va, boot0));
+            } else {
+                drv.unmap_physical(va);
+            }
+            continue;
+        }
+        match family_of(boot0) {
+            Some(_) => {
+                if let Some((_, old_va, _)) = picked {
+                    drv.unmap_physical(old_va);
+                }
+                picked = Some((bar0, va, boot0));
+                break;
+            }
+            None => {
+                if let Some((_, old_va, old_b)) = picked {
+                    if old_b != 0 && old_b != 0xFFFF_FFFF {
+                        drv.unmap_physical(va);
+                        continue;
+                    }
+                    drv.unmap_physical(old_va);
+                }
+                picked = Some((bar0, va, boot0));
+            }
+        }
+    }
+    picked
 }
