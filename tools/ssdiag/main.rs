@@ -896,6 +896,50 @@ fn run() -> i32 {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--reapply" => reapply = true,
+            "--help" | "-h" => {
+                println!(
+                    "ssdiag {ver} - in-OS NVIDIA register diagnosis + separate-lock re-apply
+
+USAGE:
+  ssdiag [--reapply] [--select <substr>]
+
+OPTIONS:
+  --reapply        per card with an OPEN FEAT gate: write SS0=0x88888888
+                   SS1=0x8 and verify by read-back (separate-lock method -
+                   restores an unlock the driver re-derived, no reboot)
+  --select <s>     only cards whose DeviceID contains <s> (multi-GPU)
+  --help           this text
+
+WHAT IT DOES:
+  1. discovers every NVIDIA Display-class GPU and its MMIO ranges from the
+     OS itself (assignments change every boot - stale addresses are refused)
+  2. wakes GC6/GCOFF-parked GPUs via the driver's own NVAPI GC6Control
+     (on demand: only when a card reads degenerate)
+  3. per-GPU register dump, badf-bucketed and colored:
+       - core/debug block: PMC_BOOT_0, PSTRAPS (decoded BAR1/BAR0/BAR3
+         sizes), FB_SIZE_MIB, GFW PLM/scratch, BSI_SCRATCH15, VGA
+         workspace, WPR2 lo/hi, MMU PLM + lock window, GSP/SEC2 CPUCTL +
+         mailboxes + EXCI, fuse rows
+       - FEAT clusters of BOTH families (Turing 0x4096xx incl. READOUT,
+         Ampere/Ada 0x823xxx)
+       - Ada four-write targets (WPR/WPR_CFG/FBPA PLMs), AD10x 64G-BAR1
+         line (CYA/CFG/XVE/BAR1 cap), 26-register PLM survey, Ampere FEAT
+         sweep
+  4. unlock verdict: FEAT SS0/SS1 == 0x88888888/0x8 => UNLOCKED
+     (field-proven to persist in Windows on the Turing relock chain)
+
+FAMILIES: maxwell..rubin recognized (incl. the GA10x 0xb7xx00a1 BOOT_0
+quirk); FEAT verdict only where the cluster is mapped (Turing/Ampere/Ada).
+
+DRIVER: pmxdrv.sys embedded (Intel-signed, hash-pinned), deployed as its
+own service on demand and stopped+deleted on every exit path.
+
+COLORS: auto on real consoles (VT), pipes/NO_COLOR degrade to plain,
+SSDIAG_COLOR=force pins on.",
+                    ver = env!("CARGO_PKG_VERSION")
+                );
+                std::process::exit(0);
+            }
             "--select" => {
                 select = Some(args.next().unwrap_or_else(|| {
                     eprintln!("--select needs a DeviceID substring (e.g. 1F07 or 4&38d5f52c)");
