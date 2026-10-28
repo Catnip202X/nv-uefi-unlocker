@@ -854,7 +854,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
             None => String::new(),
         };
-        print!("  {}={}{}{note}", paint("33", "0x"), paint("36", &format!("{off:07x}")), hx32(v));
+        print!("  {}={}{}{note}", paint("96", "0x"), paint("93", &format!("{off:07x}")), hx32(v));
         if i % 2 == 1 {
             println!();
         }
