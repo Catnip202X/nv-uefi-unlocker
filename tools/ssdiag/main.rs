@@ -838,12 +838,12 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     println!("--- ampere/ada FEAT sweep (M1 cluster) ---");
     print!("{: >24}", "");
     for off in AMPADA_SWEEP {
-        print!(" {off:09x}",);
+        print!(" {}{}", paint("96", "0x"), paint("93", &format!("{off:07x}")));
     }
     println!();
     print!("{: >24}", "value");
     for off in AMPADA_SWEEP {
-        print!(" {v:09x}", v = rd(off));
+        print!(" {}", hx32(rd(off)));
     }
     println!();
     println!("--- PLM survey (cmp170hx 26-register union) ---");
@@ -854,7 +854,9 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
             None => String::new(),
         };
-        print!("  {}={}{}{note}", paint("96", "0x"), paint("93", &format!("{off:07x}")), hx32(v));
+        let off_s = format!("{}{}", paint("96", "0x"), paint("93", &format!("{off:07x}")));
+        let val_s = hx32(v);
+        print!("  {off_s}={val_s}{note}");
         if i % 2 == 1 {
             println!();
         }
