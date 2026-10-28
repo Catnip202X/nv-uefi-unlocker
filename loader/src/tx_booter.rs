@@ -576,8 +576,10 @@ pub fn booter_fire(
 /// booter_load_tu102_direct v60-v62, proven on 40HX/50HX): the wrapper does
 /// the full B-reset itself - falcon_reset (BCR=Falcon on RISC-V-capable
 /// engines), FALCON_RM = chipId0, FBIF unblock - then port-loads. The meta
-/// address is used >4GB as-is (v61: sub-4GB meta reads get LOCKED on Turing
-/// with booter exit 0x91; the driver passes a 64-bit mailbox pair).
+/// address is above 4GB by default (dma_alloc high staging, issues
+/// #14/#16: sub-4GB meta reads get LOCKED by some Turing cards with booter
+/// exit 0x91; the driver stages at 0x110BB0000 and passes a 64-bit mailbox
+/// pair) - \tx-low-staging.txt reverts for A/B.
 pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: u64) -> Result<(), TxError> {
     const FALCON_CPUCTL: u32 = 0x100;
     const FALCON_BOOTVEC: u32 = 0x104;
@@ -608,6 +610,11 @@ pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: 
     gpu.write32(base + FALCON_BOOTVEC, 0);
     gpu.write32(base + FALCON_MAILBOX0, meta_dma as u32);
     gpu.write32(base + FALCON_MAILBOX1, (meta_dma >> 32) as u32);
+    info!(
+        "BOOTER-DIRECT: fire meta dev={meta_dma:#x} mbox0={:#010x} mbox1={:#010x}",
+        meta_dma as u32,
+        meta_dma >> 32
+    );
     // Alias probe + START-drop probe, mirroring the proven booter_fire: an
     // ALIAS_EN core must be started through +0x130, and a silently-dropped
     // START (the AD107M signature) must be caught BEFORE the HALT poll -
@@ -630,7 +637,22 @@ pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: 
     // without a payload landing (meta rejected upstream).
     let mut dma_landed = false;
     let mut sanitized = false;
+    // cmp50hx v2.69: intermediate booter mailbox codes are overwritten by
+    // the final status (e.g. 0x91) before halt - the only window is live
+    // polling. Log every observed mailbox transition with its sample index
+    // (first iteration also proves our written input actually stuck).
+    let mut mbox_prev = (u32::MAX, u32::MAX);
+    let mut mbox_log_count = 0u32;
     for i in 0..4000u32 {
+        let m0 = gpu.pci.bar_read_u32(gpu.bar, (base + FALCON_MAILBOX0) as u64);
+        let m1 = gpu.pci.bar_read_u32(gpu.bar, (base + FALCON_MAILBOX1) as u64);
+        if (m0, m1) != mbox_prev {
+            mbox_prev = (m0, m1);
+            if mbox_log_count < 24 {
+                info!("BOOTER-DIRECT: mbox live @sample {i}: mbox0={m0:#010x} mbox1={m1:#010x}");
+                mbox_log_count += 1;
+            }
+        }
         gpu.write32(base + 0x1c0, 0x600);
         let v = gpu.read32(base + 0x1c4)?;
         gpu.write32(base + 0x1c0, 0);
@@ -666,6 +688,15 @@ pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: 
     info!(
         "BOOTER-DIRECT: halted, mailbox0={mbox0:#x} mailbox1={mbox1:#x} exci={exci:#010x}"
     );
+    // Post-halt FBIF audit (issue #1's arbitration read): 0x115/0x190 are
+    // the values we programmed at fire time; anything else means the booter
+    // itself reprogrammed SEC2's aperture before dying - a strong
+    // localization signal for where the rejection happened.
+    let trans_post = gpu.read32(crate::tx::eng::SEC2_FBIF)?;
+    let ctl_post = gpu.read32(crate::tx::eng::SEC2_FBIF + 0x24)?;
+    info!(
+        "BOOTER-DIRECT: post-halt SEC2 FBIF TRANSCFG0={trans_post:#010x} CTL={ctl_post:#010x} (fire-time 0x115/0x190)"
+    );
     // DMEM forensics - the meta-acceptance discriminator. If the booter
     // ACCEPTED the meta, it DMA'd sigSize bytes from our signature buffer
     // to DMEM 0x600: the fill dword 0x4a7 (and the payload's frame values)
@@ -679,14 +710,20 @@ pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: 
         gpu.write32(base + 0x1c0, 0);
         info!("BOOTER-DIRECT: DMEM[{w:#06x}] = {v:#010x}");
     }
-    info!("BOOTER-DIRECT: DMEM verdict - 0x600=0x4a7 + frames 0x6140 => signature DMA HAPPENED (canary/ROP territory); booter residue => meta still rejected");
-    // Turing BOOT_DIRECT semantics (sixth TU106 fire, 2026-10-27): the
-    // mailboxes are the meta INPUT carrier (kernel passes the 64-bit WprMeta
-    // address in via mailbox0/1) - on halt, mailbox0 keeps the address we
-    // passed. There is no GA10x-style status return here; HALT is the
-    // completion signal and the verdict lands in verify_execution_tu10x
-    // (EXCI + WPR2 + PLM-locked + boot-stage scratch).
-    info!("BOOTER-DIRECT: input-carrier mailboxes are expected on BOOT_DIRECT - verdict deferred to POST-BOOT");
+    if dma_landed {
+        info!("BOOTER-DIRECT: DMEM verdict: signature DMA LANDED (fill 0x4a7 seen) - booter entered canary/ROP territory");
+    } else {
+        info!("BOOTER-DIRECT: DMEM verdict: signature DMA never landed - the booter rejected the meta/staging before the exploit point");
+    }
+    // Turing BOOT_DIRECT halt shapes (sixth TU106 fire + issues #14/#16):
+    // the mailboxes carry the 64-bit WprMeta address as INPUT. A healthy
+    // early halt leaves that address in mailbox0; a report_status path
+    // OVERWRITES it with a code. 0x91 = meta/staging rejection family
+    // (cmp50hx/chenxluo exit-0x91 dictionary: meta layout broken, WPR2
+    // down, or sub-4GB sysmem reads locked). Neither shape alone proves
+    // success; the verdict lands in verify_execution_tu10x (EXCI + WPR2 +
+    // PLM-locked + boot-stage scratch).
+    info!("BOOTER-DIRECT: verdict deferred to POST-BOOT (mailbox0 may be input carrier or status code)");
     Ok(())
 }
 

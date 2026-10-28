@@ -872,6 +872,15 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
         info!("TX: force-continue marker present - booter-stage failures fall through to the selector probe");
     }
 
+    // Above-4GB staging gate (issues #14/#16): Turing booters exit 0x91 on
+    // some cards when the WprMeta lands below 4GB; the high path is the
+    // driver-exact configuration. Gated to 'tu10x' so GA10x/Ada keep the
+    // allocation path they were field-verified with. \tx-low-staging.txt
+    // reverts even tu10x to the legacy path (A/B testing).
+    let high_staging = assets.family == "tu10x" && read_boot_file("\\tx-low-staging.txt").is_none();
+    crate::pci::set_high_staging(high_staging);
+    info!("TX: >4GB staging gate: {high_staging} (family {})", assets.family);
+
     // Resume-entry preflight FIRST, before anything is detached or written:
     // a non-D0 entry means the firmware did not POST this card (sleep/resume
     // or fast-startup handoff), which changes what the Windows driver will

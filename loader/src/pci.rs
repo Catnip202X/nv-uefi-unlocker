@@ -11,11 +11,27 @@ use core::ffi::c_void;
 #[cfg(feature = "tx")]
 use core::time::Duration;
 use log::info;
+#[cfg(feature = "tx")]
+use uefi::boot::AllocateType;
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
+#[cfg(feature = "tx")]
+use uefi::mem::memory_map::MemoryType;
 use uefi::proto::unsafe_protocol;
 use uefi::{Identify, Status};
 
 pub const NVIDIA_VENDOR_ID: u16 = 0x10de;
+
+/// Per-family gate for above-4GB staging (tx.rs sets it for 'tu10x' at the
+/// top of each card's transaction; every other family keeps the exact
+/// allocation path it was field-verified with). Default OFF.
+#[cfg(feature = "tx")]
+static TX_HIGH_STAGING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Enable above-4GB staging for the current card's transaction.
+#[cfg(feature = "tx")]
+pub fn set_high_staging(on: bool) {
+    TX_HIGH_STAGING.store(on, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// EFI_PCI_IO_PROTOCOL_WIDTH (only the fixed-width variants are named here).
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +292,25 @@ impl PciIo {
     /// through legal coherent memory types before giving up.
     #[cfg(feature = "tx")]
     pub fn dma_alloc(&self, len: usize) -> Result<DmaBuffer, Status> {
+        // Above-4GB staging first, gated per family (see set_high_staging):
+        // issues #14/#16 (2026-10-28) - the booter's first host DMA pulls
+        // the WprMeta into SEC2 DMEM, and on some Turing cards a sub-4GB
+        // meta is rejected with halt code 0x91 (cmp50hx v2.63: a locked
+        // card blocks sub-4GB sysmem reads - "exit 0x91"; chenxluo v61
+        // moved all TU102 SEC buffers above 4GB) while identical bytes pass
+        // below 4GB elsewhere. The reference driver itself stages the meta
+        // above 4GB (live dump 0x110BB0000) and passes a 64-bit mailbox
+        // pair, so the high path is the driver-exact configuration.
+        // \tx-low-staging.txt forces the legacy PciIo path for A/B testing.
+        if !TX_HIGH_STAGING.load(core::sync::atomic::Ordering::Relaxed) {
+            info!("DMA alloc: family not gated for >4GB staging - legacy PciIo path");
+        } else if crate::tx::read_boot_file("\\tx-low-staging.txt").is_some() {
+            info!("DMA alloc: \\tx-low-staging.txt present - legacy sub-4GB PciIo path forced");
+        } else if let Ok(b) = self.dma_alloc_high(len) {
+            return Ok(b);
+        } else {
+            info!("DMA alloc: >4GB allocation failed - falling back to PciIo path");
+        }
         // Canonical EFI_MEMORY_TYPE numbering (UEFI spec): BS-Data=4,
         // RS-Data=6. EfiReserved(0) is included only to reproduce the
         // documented EDK2 rejection for the record; the legal set for
@@ -324,9 +359,37 @@ impl PciIo {
                 continue;
             }
             log::info!("DMA alloc: {} pages memtype={name} dev={:#x}", pages, device);
-            return Ok(DmaBuffer { host: host as *mut u8, dev: device, mapping, pages, len, released: false });
+            return Ok(DmaBuffer { host: host as *mut u8, dev: device, mapping, pages, len, released: false, high: false });
         }
         Err(Status::OUT_OF_RESOURCES)
+    }
+
+    /// Above-4GB staging allocation (raw boot-services pages). The device
+    /// address is the physical address: the falcon FBIF is programmed in
+    /// PHYSICAL mode and EDK2 PciIo.Map is an identity mapping without an
+    /// IOMMU driver (issue #1 arbitration), so there is no Map bookkeeping
+    /// on this path - `release` frees via boot::free_pages. Turing GSP/SEC2
+    /// are 64-bit DMA masters (the driver itself stages at 0x110BB0000).
+    #[cfg(feature = "tx")]
+    fn dma_alloc_high(&self, len: usize) -> Result<DmaBuffer, Status> {
+        let pages = len.div_ceil(4096);
+        let ptr = boot::allocate_pages(
+            AllocateType::MaxAddress(u64::MAX),
+            MemoryType::BOOT_SERVICES_DATA,
+            pages,
+        )
+        .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        let dev = ptr.as_ptr() as usize as u64;
+        info!("DMA alloc: {pages} pages memtype=EfiBootServicesData HIGH dev={dev:#x}");
+        Ok(DmaBuffer {
+            host: ptr.as_ptr(),
+            dev,
+            mapping: core::ptr::null_mut(),
+            pages,
+            len,
+            released: false,
+            high: true,
+        })
     }
 
     /// Bulk u32 read from a BAR window (used for the PROM CRC pass).
@@ -366,6 +429,10 @@ pub struct DmaBuffer {
     pub pages: usize,
     pub len: usize,
     released: bool,
+    /// true = raw boot-services allocation above 4GB (dma_alloc_high):
+    /// `release` must free via boot::free_pages, skipping the PciIo
+    /// unmap/free_buffer pair (there is no mapping to undo).
+    high: bool,
 }
 
 #[cfg(feature = "tx")]
@@ -379,6 +446,17 @@ impl DmaBuffer {
             return true;
         }
         self.released = true;
+        if self.high {
+            // Raw boot-services allocation (dma_alloc_high): no PciIo
+            // mapping to undo - free via the matching boot service.
+            return match core::ptr::NonNull::new(self.host) {
+                Some(p) => {
+                    // Safety: live allocation from boot::allocate_pages.
+                    unsafe { boot::free_pages(p, self.pages) }.is_ok()
+                }
+                None => false,
+            };
+        }
         // Safety: buffer still mapped/allocated; protocol outlives boot.
         unsafe {
             let s1 = (pci.0.unmap)(&pci.0 as *const _ as *mut _, self.mapping);
