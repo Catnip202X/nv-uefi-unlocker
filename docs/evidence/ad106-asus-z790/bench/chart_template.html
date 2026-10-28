@@ -47,7 +47,10 @@
     legend.append(s);
   });
   const W = 1456, H = 600, L = 64, R = 8, T = 40, B = 64;
-  const max = 100, ticks = [0, 20, 40, 60, 80, 100];
+  const peak = Math.max(...groups.flatMap(g => g.v));
+  const step = peak > 120 ? 40 : 20;
+  const max = Math.ceil(peak * 1.12 / step) * step;
+  const ticks = Array.from({ length: max / step + 1 }, (_, i) => i * step);
   const y = v => T + (H - T - B) * (1 - v / max);
   const svg = document.getElementById("c");
   const ns = "http://www.w3.org/2000/svg";
