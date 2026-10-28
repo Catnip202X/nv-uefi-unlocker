@@ -98,6 +98,9 @@ mod win {
         pub fn GetLastError() -> u32;
         pub fn LoadLibraryW(name: *const u16) -> Handle;
         pub fn GetProcAddress(h: Handle, name: *const u8) -> *const c_void;
+        pub fn GetStdHandle(nStdHandle: u32) -> Handle;
+        pub fn GetConsoleMode(hConsole: Handle, mode: *mut u32) -> i32;
+        pub fn SetConsoleMode(hConsole: Handle, mode: u32) -> i32;
     }
 
     #[repr(C)]
@@ -129,6 +132,70 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn last_err() -> u32 {
     unsafe { win::GetLastError() }
+}
+
+// ---------------------------------------------------------------- color
+// Light ANSI colorizer: 0x prefix yellow + digits cyan, UNLOCKED green,
+// NOT_UNLOCKED red, badf buckets red, OPEN green. Enabled only on a real
+// console after flipping ENABLE_VIRTUAL_TERMINAL_PROCESSING (Win10+); a
+// pipe/redirect or NO_COLOR degrades to plain text automatically.
+
+static COLOR_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn color_init() {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return;
+    }
+    // SSDIAG_COLOR=force pins colors on (for testing through pipes).
+    let forced = std::env::var("SSDIAG_COLOR").is_ok_and(|v| v == "force");
+    if !forced {
+        const STD_OUTPUT_HANDLE: u32 = u32::MAX - 10; // (DWORD)-11
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+        unsafe {
+            let h = win::GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut mode = 0u32;
+            // GetConsoleMode fails on a redirected handle - no console, no color
+            if win::GetConsoleMode(h, &mut mode) == 0 {
+                return;
+            }
+            win::SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+    COLOR_ON.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn paint(code: &str, s: &str) -> String {
+    if COLOR_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("\x1b[{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
+}
+
+/// 0x-prefixed 8-digit u32: prefix yellow, digits cyan.
+fn hx32(v: u32) -> String {
+    if COLOR_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("\x1b[33m0x\x1b[36m{v:08x}\x1b[0m")
+    } else {
+        format!("{v:#010x}")
+    }
+}
+
+/// 0x-prefixed u64 address: prefix yellow, digits cyan.
+fn hxaddr(v: u64) -> String {
+    if COLOR_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        format!("\x1b[33m0x\x1b[36m{v:016x}\x1b[0m")
+    } else {
+        format!("{v:#018x}")
+    }
+}
+
+fn green(s: &str) -> String {
+    paint("92", s)
+}
+
+fn red(s: &str) -> String {
+    paint("91", s)
 }
 
 // ---------------------------------------------------------------- NVAPI GC6 wake
@@ -213,7 +280,11 @@ mod nvapi_wake {
                         }
                         report.push_str(&format!(
                             "gpu{h}: GC6 -> {}; ",
-                            if woken { "D0" } else { "wake timeout" }
+                            if woken {
+                                super::green("D0")
+                            } else {
+                                super::red("wake timeout")
+                            }
                         ));
                     }
                     s => report.push_str(&format!("gpu{h}: state {s}; ")),
@@ -706,8 +777,8 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     for (name, off) in CORE_ROWS {
         let v = rd(off);
         match badf_bucket(v) {
-            Some(b) => println!("{name:<22} = {v:#010x} [{b}]"),
-            None => println!("{name:<22} = {v:#010x}"),
+            Some(b) => println!("{name:<22} = {} [{}]", hx32(v), red(b)),
+            None => println!("{name:<22} = {}", hx32(v)),
         }
     }
     // PSTRAPS decode (loader sample.rs fields, NvStrapsReBar-verified)
@@ -744,7 +815,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
                 },
                 _ => String::new(),
             };
-            println!("  {label:<20} {name:<9} = {v:#010x}{note}");
+            println!("  {label:<20} {name:<9} = {}{note}", hx32(v));
         }
     }
     println!("--- family-specific lines (safe reads; badf on the wrong die is expected) ---");
@@ -761,7 +832,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
                     None => String::new(),
                 },
             };
-            println!("  {label:<15} {name:<22} = {v:#010x}{note}");
+            println!("  {label:<15} {name:<22} = {}{note}", hx32(v));
         }
     }
     println!("--- ampere/ada FEAT sweep (M1 cluster) ---");
@@ -783,7 +854,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
             None => String::new(),
         };
-        print!("  {off:#09x}={v:#010x}{note}");
+        print!("  {}={}{}{note}", paint("33", "0x"), paint("36", &format!("{off:07x}")), hx32(v));
         if i % 2 == 1 {
             println!();
         }
@@ -794,11 +865,12 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     for (name, off) in PRIV_ROWS {
         let v = rd(off);
         let note = badf_bucket(v).map(|b| format!(" [{b}]")).unwrap_or_default();
-        println!("{name:<22} = {v:#010x}{note}");
+        println!("{name:<22} = {}{note}", hx32(v));
     }
 }
 
 fn main() {
+    color_init();
     let code = run();
     // strict remove-when-done: our own service and temp file never outlive
     // this process - cleanup runs on every path that got past arg parsing.
@@ -873,7 +945,7 @@ fn run() -> i32 {
         println!("===== GPU {}/{}: {} =====", i + 1, gpus.len(), g.id);
         println!("ranges:");
         for (a, b) in &g.ranges {
-            println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
+            println!("  {}-{} ({} MiB)", hxaddr(*a), hxaddr(*b), (b - a + 1) >> 20);
         }
         let mut picked = walk_candidates(&drv, g);
         // degenerate reads (GC6/GCOFF park, D3, MEM decode off) -> one NVAPI
@@ -891,13 +963,13 @@ fn run() -> i32 {
             rc = 1;
             continue;
         };
-        println!("BAR0: {bar0:#x}");
+        println!("BAR0: {}", hxaddr(bar0));
 
         if boot0 == 0xFFFF_FFFF || boot0 == 0 {
             drv.unmap_physical(va);
             println!(
                 "BAR0 reads {} - still degenerate after GC6 wake attempt: device D3 / MEM decode off / driver unbound; nothing to diagnose",
-                if boot0 == 0 { "all zeros" } else { "all ones" }
+                red(if boot0 == 0 { "all zeros" } else { "all ones" })
             );
             rc = 1;
             continue;
@@ -908,7 +980,7 @@ fn run() -> i32 {
         let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
 
         let Some((fam_name, regs)) = family_of(boot0) else {
-            println!("PMC_BOOT_0={boot0:#010x} - NVIDIA-class but unknown die; diagnosis-only pass (FEAT addresses unmapped for this family)");
+            println!("PMC_BOOT_0={} - NVIDIA-class but unknown die; diagnosis-only pass (FEAT addresses unmapped for this family)", hx32(boot0));
             dump_debug(&rd);
             drv.unmap_physical(va);
             rc = 1;
@@ -928,14 +1000,16 @@ fn run() -> i32 {
         let ss0 = rd(get("SS0"));
         let ss1 = rd(get("SS1"));
         let unlocked = ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK;
-        println!(
-            "VERDICT [{fam_name}]: {}",
-            if unlocked { "UNLOCKED (override values live)" } else { "not unlocked" }
-        );
+        let verdict = if unlocked {
+            format!("{} (override values live)", green("UNLOCKED"))
+        } else {
+            red("NOT_UNLOCKED")
+        };
+        println!("VERDICT [{fam_name}]: {verdict}");
 
         if reapply {
             if plm != 0xFFFF_FFFF {
-                println!("reapply REFUSED: FEAT PLM gate is closed - re-run the USB unlock instead");
+                println!("{}: FEAT PLM gate is closed - re-run the USB unlock instead", red("reapply REFUSED"));
                 rc = 1;
             } else {
                 wr(get("SS0"), SS0_UNLOCK);
@@ -944,8 +1018,10 @@ fn run() -> i32 {
                 let rb1 = rd(get("SS1"));
                 let ok = rb0 == SS0_UNLOCK && rb1 == SS1_UNLOCK;
                 println!(
-                    "reapply: SS0={rb0:#010x} SS1={rb1:#010x} -> {}",
-                    if ok { "OK" } else { "READBACK MISMATCH" }
+                    "reapply: SS0={} SS1={} -> {}",
+                    hx32(rb0),
+                    hx32(rb1),
+                    if ok { green("OK") } else { red("READBACK MISMATCH") }
                 );
                 if !ok {
                     rc = 1;
