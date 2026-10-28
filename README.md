@@ -2,7 +2,7 @@
 
 [中文](README.md) | [English](README.en.md)
 
-UEFI 预驱动 NVIDIA GPU 解锁器（Windows，Rust）。在 NVIDIA 驱动加载**之前**的
+20 \~ 40系 全平台操作系统通用 UEFI 预驱动 NVIDIA GPU 解锁器（开发环境为 Windows，Rust）。在 NVIDIA 驱动加载**之前**的
 UEFI DXE 时窗执行完整固件事务：SEC2 scrubber → FWSEC-FRTS（WPR2）→ 签名
 Booter 启动 GSP-RM →（门控后）V67 四写 payload → 读回验证 → FLR → 链式交回
 Windows Boot Manager。
