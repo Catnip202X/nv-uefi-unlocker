@@ -483,7 +483,12 @@ fn decode_ss(v: u32, width: u32) -> String {
             if nib == 0 {
                 ".".to_string()
             } else if nib & 0x8 != 0 {
-                format!("{}*", names[(nib & 7) as usize].trim_start_matches("1/"))
+                // rates 4-7 exist in the field but have no documented meaning
+                let rate = match nib & 7 {
+                    r @ 0..=3 => names[r as usize],
+                    r => return format!("?{r:x}*"),
+                };
+                format!("{rate}*")
             } else {
                 format!("r{}", nib & 7)
             }
