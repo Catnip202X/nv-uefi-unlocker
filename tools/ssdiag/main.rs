@@ -181,12 +181,16 @@ fn hx32(v: u32) -> String {
     }
 }
 
-/// 0x-prefixed u64 address: prefix yellow, digits cyan.
+/// 0x-prefixed u64 address: prefix bright cyan, digits bright yellow.
+/// Width = minimal even nibble count (no leading-zero padding: a 32-bit
+/// BAR reads 0xc0000000, a >4GiB BAR1 reads 0x6200000000).
 fn hxaddr(v: u64) -> String {
+    let digits = format!("{v:x}");
+    let pad = digits.len() + (digits.len() & 1);
     if COLOR_ON.load(std::sync::atomic::Ordering::Relaxed) {
-        format!("\x1b[33m0x\x1b[36m{v:016x}\x1b[0m")
+        format!("\x1b[96m0x\x1b[93m{digits:0>pad$}\x1b[0m")
     } else {
-        format!("{v:#018x}")
+        format!("{digits:0>pad$}")
     }
 }
 
@@ -838,7 +842,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     println!("--- ampere/ada FEAT sweep (M1 cluster) ---");
     print!("{: >24}", "");
     for off in AMPADA_SWEEP {
-        print!(" {}{}", paint("96", "0x"), paint("93", &format!("{off:07x}")));
+        print!(" {}{}", paint("96", "0x"), paint("93", &format!("{off:08x}")));
     }
     println!();
     print!("{: >24}", "value");
@@ -854,7 +858,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
             None => String::new(),
         };
-        let off_s = format!("{}{}", paint("96", "0x"), paint("93", &format!("{off:07x}")));
+        let off_s = format!("{}{}", paint("96", "0x"), paint("93", &format!("{off:08x}")));
         let val_s = hx32(v);
         print!("  {off_s}={val_s}{note}");
         if i % 2 == 1 {
