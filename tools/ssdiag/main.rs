@@ -809,12 +809,16 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
         for (name, off) in regs {
             let v = rd(*off);
             let note = match *name {
-                "PLM" => format!(" ({})", decode_plm(v)),
+                "PLM" => {
+                    let d = decode_plm(v);
+                    let d = if d == "OPEN" { green("OPEN") } else { d.to_string() };
+                    format!(" ({d})")
+                }
                 "SS0" => format!(" [{}]", decode_ss(v, 8)),
                 "SS1" => format!(" [{}]", decode_ss(v, 1)),
                 "READOUT" | "READOUT_1" => match badf_bucket(v) {
-                    Some(b) => format!(" [{b}]"),
-                    None if v == 0 => " [full speed]".into(),
+                    Some(b) => format!(" [{}]", red(b)),
+                    None if v == 0 => format!(" [{}]", green("full speed")),
                     None => String::new(),
                 },
                 _ => String::new(),
@@ -832,7 +836,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             let note = match *name {
                 n if n.ends_with("PLM") => format!(" ({})", decode_plm(v)),
                 _ => match badf_bucket(v) {
-                    Some(b) => format!(" [{b}]"),
+                    Some(b) => format!(" [{}]", red(b)),
                     None => String::new(),
                 },
             };
@@ -854,8 +858,8 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     for (i, off) in PLM_SURVEY.iter().enumerate() {
         let v = rd(*off);
         let note = match badf_bucket(v) {
-            Some(b) => format!(" [{b}]"),
-            None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
+            Some(b) => format!(" [{}]", red(b)),
+            None if v == 0xFFFF_FFFF => format!(" [{}]", green("OPEN")),
             None => String::new(),
         };
         let off_s = format!("{}{}", paint("96", "0x"), paint("93", &format!("{off:08x}")));
@@ -870,7 +874,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
     }
     for (name, off) in PRIV_ROWS {
         let v = rd(off);
-        let note = badf_bucket(v).map(|b| format!(" [{b}]")).unwrap_or_default();
+        let note = badf_bucket(v).map(|b| format!(" [{}]", red(b))).unwrap_or_default();
         println!("{name:<22} = {}{note}", hx32(v));
     }
 }
