@@ -15,6 +15,8 @@ use log::info;
 use uefi::boot::AllocateType;
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 #[cfg(feature = "tx")]
+use uefi::mem::memory_map::MemoryMap as _;
+#[cfg(feature = "tx")]
 use uefi::mem::memory_map::MemoryType;
 use uefi::proto::unsafe_protocol;
 use uefi::{Identify, Status};
@@ -358,7 +360,11 @@ impl PciIo {
                 let _st = unsafe { (self.0.free_buffer)(&self.0 as *const _ as *mut _, pages, host) };
                 continue;
             }
-            log::info!("DMA alloc: {} pages memtype={name} dev={:#x}", pages, device);
+            // The band is derived from the actual device address, not from
+            // which branch ran (issue #19: a "HIGH" label on a sub-4GB
+            // address is worse than no label).
+            let band = if device >= 0x1_0000_0000 { "HIGH" } else { "LOW" };
+            log::info!("DMA alloc: {pages} pages memtype={name} dev={device:#x} [{band}] (PciIo)");
             return Ok(DmaBuffer { host: host as *mut u8, dev: device, mapping, pages, len, released: false, high: false });
         }
         Err(Status::OUT_OF_RESOURCES)
@@ -372,24 +378,81 @@ impl PciIo {
     /// are 64-bit DMA masters (the driver itself stages at 0x110BB0000).
     #[cfg(feature = "tx")]
     fn dma_alloc_high(&self, len: usize) -> Result<DmaBuffer, Status> {
+        const FOUR_GB: u64 = 0x1_0000_0000;
         let pages = len.div_ceil(4096);
-        let ptr = boot::allocate_pages(
-            AllocateType::MaxAddress(u64::MAX),
-            MemoryType::BOOT_SERVICES_DATA,
-            pages,
-        )
-        .map_err(|_| Status::OUT_OF_RESOURCES)?;
-        let dev = ptr.as_ptr() as usize as u64;
-        info!("DMA alloc: {pages} pages memtype=EfiBootServicesData HIGH dev={dev:#x}");
-        Ok(DmaBuffer {
-            host: ptr.as_ptr(),
-            dev,
-            mapping: core::ptr::null_mut(),
-            pages,
-            len,
-            released: false,
-            high: true,
-        })
+        // MaxAddress(u64::MAX) is NOT "allocate at the top of RAM": DxeCore's
+        // CoreFindFreePagesI selects the highest free range UNDER the cap
+        // (Target=0, best match = DescEnd > Target), and on the field boards
+        // that range sat at 1-2 GiB - v2.1.1's "HIGH" allocations landed at
+        // 0x81e83000 et al (issues #17/#19). Walk the memory map ourselves
+        // and AllocateAddress inside a conventional descriptor at/above
+        // 4 GiB: per spec this lands exactly at the requested address or
+        // fails, so placement is deterministic on any firmware.
+        let mmap = boot::memory_map(MemoryType::BOOT_SERVICES_DATA)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        let mut candidates = 0u32;
+        let mut failed = 0u32;
+        for d in mmap.entries() {
+            if d.ty != MemoryType::CONVENTIONAL {
+                continue;
+            }
+            let base = d.phys_start;
+            let end = base.saturating_add((d.page_count as u64) * 4096);
+            let start = base.max(FOUR_GB);
+            if start >= end || (end - start) < (pages as u64) * 4096 {
+                continue;
+            }
+            candidates += 1;
+            if let Ok(ptr) = boot::allocate_pages(
+                AllocateType::Address(start),
+                MemoryType::BOOT_SERVICES_DATA,
+                pages,
+            ) {
+                let dev = ptr.as_ptr() as usize as u64;
+                let band = if dev >= FOUR_GB { "HIGH" } else { "LOW" };
+                info!(
+                    "DMA alloc: {pages} pages memtype=EfiBootServicesData {band} dev={dev:#x} (descriptor {base:#x}+{:#x})", (d.page_count as u64) * 4096
+                );
+                return Ok(DmaBuffer {
+                    host: ptr.as_ptr(),
+                    dev,
+                    mapping: core::ptr::null_mut(),
+                    pages,
+                    len,
+                    released: false,
+                    high: true,
+                });
+            }
+            failed += 1;
+            if failed >= 4 {
+                break;
+            }
+        }
+        // Map forensics for the field report (issue #17: "EFI memory map not
+        // yet captured"): every conventional descriptor ending at/above
+        // 2 GiB, plus the count fully above 4 GiB.
+        let mut above4g = 0u32;
+        for d in mmap.entries() {
+            if d.ty != MemoryType::CONVENTIONAL {
+                continue;
+            }
+            let end = d.phys_start.saturating_add((d.page_count as u64) * 4096);
+            if d.phys_start >= FOUR_GB {
+                above4g += 1;
+            }
+            if end >= 0x8000_0000 {
+                info!(
+                    "MEMMAP: conventional {:#x}-{:#x} ({} MiB)",
+                    d.phys_start,
+                    end,
+                    ((d.page_count as u64) * 4096) >> 20
+                );
+            }
+        }
+        info!(
+            "DMA alloc: no usable >4GB conventional space (candidates={candidates} failed={failed}, {above4g} conventional descriptors above 4GB)"
+        );
+        Err(Status::NOT_FOUND)
     }
 
     /// Bulk u32 read from a BAR window (used for the PROM CRC pass).
