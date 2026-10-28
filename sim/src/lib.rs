@@ -255,6 +255,7 @@ mod scenarios;
 #[cfg(test)]
 mod scenarios2;
 
+pub mod devpath;
 pub mod dma;
 pub mod layout;
 pub mod radix;

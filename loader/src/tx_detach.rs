@@ -36,6 +36,40 @@ fn device_path_bytes(handle: Handle) -> Option<alloc::vec::Vec<u8>> {
     Some(dp.as_bytes().to_vec())
 }
 
+/// Node-aligned device-path ownership: `child` belongs to `parent` when the
+/// parent's node sequence (its END node excluded) appears byte-exact at the
+/// same offsets in `child`.
+///
+/// The raw byte-prefix compare this replaces failed on every NVIDIA GOP so
+/// far seen: the child path replaces the parent's trailing END node with
+/// extra nodes (an AcpiAdr display node) before its own END, so the compare
+/// tripped over the parent's END bytes and the target's own GOP read as
+/// "foreign". Instances: the issue #14 flip board, the ASUS Z790 2803
+/// report (stage 1 never ran there), and the TU106 1f07 regression log of
+/// 2026-10-28 (GOP-TOPOLOGY: 36 B present, gone after the GPU PCI
+/// disconnect, back after reconnect - the dGPU's own GOP, judged foreign).
+/// Reference implementation + shape tests: sim/src/devpath.rs.
+pub fn path_belongs_to(parent: &[u8], child: &[u8]) -> bool {
+    // Byte offset where the parent's END node (type 0x7f) begins; a
+    // malformed node (length < 4 or past the buffer) ends the walk.
+    let mut body = 0usize;
+    let mut nodes = 0usize;
+    let mut i = 0usize;
+    while i + 4 <= parent.len() {
+        let len = u16::from_le_bytes([parent[i + 2], parent[i + 3]]) as usize;
+        if len < 4 || i + len > parent.len() || parent[i] == 0x7f {
+            break;
+        }
+        body = i + len;
+        nodes += 1;
+        i += len;
+    }
+    if nodes == 0 {
+        return false;
+    }
+    child.len() >= body && child[..body] == parent[..body]
+}
+
 /// Does this GOP handle belong to the target GPU? The vendor GOP child
 /// handle's device path extends the PCI device path, so a node-aligned
 /// prefix match identifies ownership. A false "no" is safe: the stage-3
@@ -43,7 +77,7 @@ fn device_path_bytes(handle: Handle) -> Option<alloc::vec::Vec<u8>> {
 /// check only decides whether we ALSO tear down other cards' GOPs.
 fn gop_belongs_to_target(gop: Handle, pci_handle: Handle) -> bool {
     match (device_path_bytes(pci_handle), device_path_bytes(gop)) {
-        (Some(p), Some(g)) => g.len() >= p.len() && g[..p.len()] == p[..],
+        (Some(p), Some(g)) => path_belongs_to(&p, &g),
         _ => false,
     }
 }
