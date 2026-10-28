@@ -368,14 +368,19 @@ struct Gpu {
 }
 
 impl Gpu {
-    /// BAR0 candidate: the smallest range >= 16 MiB (BAR0 is 16 MiB << idx
-    /// per straps; the audio/USB-C companion functions never get that big).
-    fn bar0_candidate(&self) -> Option<u64> {
-        self.ranges
+    /// BAR0 candidates, SMALLEST-SIZE first (BAR0 is 16 MiB << idx per
+    /// straps; a ReBAR BAR1 can start at a lower address and must not win -
+    /// 2026-10-28: address-min picked the 256 MiB BAR1 aperture). The
+    /// caller walks the list and lets the PMC sanity read arbitrate.
+    fn bar0_candidates(&self) -> Vec<u64> {
+        let mut c: Vec<(u64, u64)> = self
+            .ranges
             .iter()
+            .copied()
             .filter(|(a, b)| b - a + 1 >= 0x100_0000)
-            .map(|(a, _)| *a)
-            .min()
+            .collect();
+        c.sort_by_key(|(a, b)| b - a + 1);
+        c.into_iter().map(|(a, _)| a).collect()
     }
 }
 
@@ -704,7 +709,7 @@ fn run() -> i32 {
         }
     }
     // only functions with a BAR0-class window (companion audio/USB-C are small)
-    gpus.retain(|g| g.bar0_candidate().is_some());
+    gpus.retain(|g| !g.bar0_candidates().is_empty());
     if gpus.is_empty() {
         eprintln!("no NVIDIA function with a BAR0-class (>=16 MiB) window found");
         return 2;
@@ -729,30 +734,44 @@ fn run() -> i32 {
         for (a, b) in &g.ranges {
             println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
         }
-        let Some(bar0) = g.bar0_candidate() else { continue };
+        // walk candidates smallest-size first; the PMC sanity read arbitrates
+        let mut picked: Option<(u64, u64, u32)> = None; // (bar0, va, boot0)
+        for bar0 in g.bar0_candidates() {
+            const PAGES: u32 = 4096; // 16 MiB BAR0
+            let va = match drv.map_physical(bar0, PAGES) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("map BAR0@{bar0:#x} failed: {e}");
+                    rc = 1;
+                    continue;
+                }
+            };
+            let boot0 =
+                unsafe { ((va as *const u8).add(0) as *const u32).read_volatile() };
+            match family_of(boot0) {
+                Some(_) => {
+                    picked = Some((bar0, va, boot0));
+                    break;
+                }
+                None => {
+                    // not a PMC (e.g. the ReBAR aperture reads 0) - unmap, try next
+                    drv.unmap_physical(va);
+                }
+            }
+        }
+        let Some((bar0, va, boot0)) = picked else {
+            println!("no candidate range decoded as an NVIDIA PMC - card skipped");
+            rc = 1;
+            continue;
+        };
         println!("BAR0: {bar0:#x}");
 
-        const PAGES: u32 = 4096; // 16 MiB BAR0
-        let va = match drv.map_physical(bar0, PAGES) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("map BAR0@{bar0:#x} failed: {e}");
-                rc = 1;
-                continue;
-            }
-        };
         let base = va as *const u8;
         let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
         let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
 
-        let boot0 = rd(0x0);
         let Some((fam_name, regs)) = family_of(boot0) else {
-            // validated against the OS ranges, yet not an NVIDIA PMC - stop
-            // reading this card immediately
-            drv.unmap_physical(va);
-            eprintln!("PMC_BOOT_0={boot0:#010x} does not look like an NVIDIA BAR0 - skipping card");
-            rc = 1;
-            continue;
+            unreachable!("picked candidates are family-validated");
         };
         dump_debug(&rd);
 
