@@ -268,6 +268,30 @@ essence). **The supported environment is native PCIe slots / dGPU-direct
 laptops.** TB / hot-plug-root-port users: treat "no gain after entering
 the OS" as expected behavior — no need to file an issue.
 
+**TB field-test call (2026-10-29)**: `tools/ssdiag` turns this scenario
+into a cheap experiment — please run it and report the data (Discussions
+or a new issue, full output attached):
+
+1. Unlock via the stick → in Windows, run `ssdiag` for the verdict.
+   **Gate open + stock values** (SS0/SS1 not 0x88888888/0x8) → the values
+   were re-derived; `ssdiag --reapply` can write them back without a
+   reboot. **Gate closed** (reads come back badf) → the tunnel rebuild
+   performed a real reset; only the USB stick helps, and a reapply is
+   meaningless in that state.
+2. On a "gate open" verdict, run `ssdiag --reapply` and measure the same
+   GEMM load before/after (cuBLAS/GPU-Z both fine).
+3. Paste both `ssdiag` outputs and the throughput pair. Success or
+   failure, every report is a data point: for the first time this
+   distinguishes "the tunnel rebuild only re-derived the values" from
+   "it performed a real reset" — exactly what we could not tell before,
+   which is why the whole scenario was filed as a blanket known
+   limitation.
+
+Boundaries unchanged: after dock sleep / power cut (D3cold) a reapply is
+meaningless (the card lost power; re-powering goes through PERST# and
+re-erases); a pure link retrain (below) does not touch the unlock and
+needs no reapply.
+
 One PCIe-semantics clarification worth keeping: **a pure link retrain
 (Retrain Link / a TLS change / the LTSSM re-run triggered by ASPM config)
 does not reset the endpoint** — device registers and config space are
@@ -561,6 +585,7 @@ sysmem; switching the FBIF TARGET has no effect), see
 loader/    EFI application crate (no_std, x86_64-unknown-uefi, Rust + uefi-rs)
 assets/    host-side asset pipeline (pinned-hash download/verify/extract/payload generation, pure Rust)
 sim/       behavioral simulator + transaction state-machine tests (GPU-free development)
+tools/     ssdiag: in-OS Windows unlock verdict / no-reboot repair (pmxdrv.sys embedded)
 docs/      reports, milestone evidence (evidence-as-commits), register cold-value tables, open questions
 ```
 
@@ -613,6 +638,58 @@ returns the card to its factory state. If issues persist: another full
 power cycle; last resort DDU + driver reinstall (this tool writes nothing
 persistent; a misbehaving driver can only come from handoff timing, not
 permanent damage).
+
+## In-OS unlock verdict and repair on Windows: `tools/ssdiag`
+
+Answers "is the unlock still live this boot?" without a reboot, and on
+Ampere/Ada supports a **no-reboot repair**: when the FEAT gate is open but
+the SS overrides were re-derived away by driver devinit (driver init,
+sleep/resume, Thunderbolt rail re-enumeration), `--reapply` writes
+SS0=0x88888888 / SS1=0x8 back and verifies by read-back (the
+separate-lock method, issues #6/#19 lineage). On the Turing relock chain
+the gate is closed inside Windows, so the tool stays read-only there —
+but the Turing SS values persist for the whole Windows session, so the
+in-OS read-back **is** a valid verdict; gate closed = re-run the stick.
+
+```text
+ssdiag                        # verdict: dump every NVIDIA display GPU
+ssdiag --reapply              # repair: write the SS overrides back where the gate is open
+ssdiag --select 2504          # multi-GPU: only cards whose DeviceID contains 2504
+```
+
+Capabilities and boundaries (v0.4.x):
+
+- **BAR0 is always discovered from the OS** (physical assignments change
+  every boot; a remembered base once hard-hung a machine, so stale
+  addresses are refused). Multi-GPU: per-card dumps grouped by DeviceID,
+  Display-class functions only (companion audio/USB-C excluded).
+- The dump surface is the union of the registers the reference unlockers
+  touch: the core/debug block (PMC_BOOT_0, PSTRAPS decoded, FB_SIZE_MIB,
+  GFW, BSI_SCRATCH15, WPR2, MMU PLM + lock, GSP/SEC2, fuse rows), **FEAT
+  clusters of both families** (Turing 0x4096xx incl. READOUT, Ampere/Ada
+  0x823xxx), the Ada four-write targets (WPR/WPR_CFG/FBPA PLMs), the
+  AD10x 64G-BAR1 line (CYA/CFG/XVE/cap mirror), the cmp170hx 26-register
+  PLM survey, the Ampere FEAT sweep. Read-backs are badf-bucketed
+  (PRIV_VIOLATION / UNDECODED / FLOORSWEPT) with colored verdicts and
+  addresses (pipes/`NO_COLOR` degrade to plain text).
+- Families Maxwell..Rubin recognized (incl. the GA10x
+  `BOOT_0=0xb7xx00a1` quirk); the FEAT unlock verdict only where the
+  cluster is mapped (Turing/Ampere/Ada).
+- GPUs reading degenerate are woken on demand via the driver's own NVAPI
+  GC6Control (GC6/GCOFF parking; field-proven on a 4060 Laptop).
+- Driver safety: `pmxdrv.sys` (Intel-signed, hash-pinned at build time,
+  re-verified at startup fail-closed) is **embedded in the exe**, deployed
+  under its own service name `SSDIAG_PMXDRV`, and on every exit path the
+  service is stopped + deleted and the temp file removed; services owned
+  by other tools are never touched. If a PMXDRV device already exists
+  (e.g. deployed by nvoc) it is borrowed with zero service changes. The
+  deploy path needs admin (borrowing a running device works unelevated).
+- Thunderbolt eGPUs: a reapply is only meaningful while the rail stays
+  powered (see the Thunderbolt section above).
+
+Get it: the release zip ships `ssdiag-x86_64-windows.exe` since v2.1.5;
+source in `tools/ssdiag` (standalone crate, `cargo build --release` to
+rebuild — see its `README.md`).
 
 ## Build
 
