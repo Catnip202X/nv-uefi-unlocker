@@ -435,6 +435,7 @@ FP16 46.78 → **75.28** TFLOPS（`docs/evidence/ad106-4060ti-desktop/`，
 loader/    EFI 应用 crate（no_std, x86_64-unknown-uefi, Rust + uefi-rs）
 assets/    host 侧资产管线（钉 hash 下载/校验/抽取/载荷生成，纯 Rust）
 sim/       行为级模拟器 + 事务状态机测试（无 GPU 开发）
+tools/     ssdiag：Windows 在系统内解锁状态诊断/免重启修复（pmxdrv.sys 内嵌）
 docs/      报告、里程碑证据（evidence-as-commits）、寄存器冷值表、开放问题
 ```
 
@@ -470,6 +471,49 @@ Windows 引导 → 检查设备管理器/事件日志驱动状态 → 记录证�
 设备管理器看错误码；事件日志查 nvlddmkm/Xid。解锁效果是易失覆盖（断电即失），
 一次冷启动即回到出厂状态。若仍异常：再次完全断电；最后手段 DDU 重装驱动
 （本工具不写任何持久存储，驱动状态异常只可能来自交棒时序，不是永久损坏）。
+
+## Windows 侧解锁状态诊断与修复：`tools/ssdiag`
+
+不重启即可回答"这次开机解锁还在吗"，并在 Ampere/Ada 上支持**免重启修复**：
+FEAT 门开着但 SS 覆盖值被驱动 devinit 重推导掉时（驱动初始化、睡眠唤醒、
+雷电掉电重枚举后），`--reapply` 直接把 SS0=0x88888888 / SS1=0x8 写回并读回
+验证（separate-lock 方法，issue #6/#19 谱系）。Turing relock 链在 Windows 内
+门是关的，工具保持只读——但 Turing 的 SS 覆盖值在 Windows 会话内持久，
+**系统内读回即为有效判据**；门关则重跑 U 盘即可。
+
+```text
+ssdiag                        # 诊断：转储每张 NVIDIA 显示卡的寄存器并给出解锁判定
+ssdiag --reapply              # 修复：对门开但值不在的卡写回 SS 覆盖值
+ssdiag --select 2504          # 多卡系统只看 DeviceID 含 2504 的卡
+```
+
+能力与边界（v0.4.x）：
+
+- **BAR0 一律由 OS 自发现**（物理赋值每次引导都变，旧地址曾硬死机；陈旧
+  地址一律拒绝）。多卡按 DeviceID 分组逐卡转储，仅 Display 类函数
+  （伴生 audio/USB-C 排除）。
+- 转储面 = 参考 unlocker 们触碰寄存器的并集：核心/debug 块（PMC_BOOT_0、
+  PSTRAPS 解码、FB_SIZE_MIB、GFW、BSI_SCRATCH15、WPR2、MMU PLM+lock、
+  GSP/SEC2、熔丝行）、**双家族 FEAT 簇**（Turing 0x4096xx 含 READOUT +
+  Ampere/Ada 0x823xxx）、Ada 四写目标（WPR/WPR_CFG/FBPA PLM）、
+  AD10x 64G-BAR1 线（CYA/CFG/XVE/cap 镜像）、26 寄存器 PLM survey、
+  Ampere FEAT sweep。读回垃圾按 badf 分桶（PRIV_VIOLATION/UNDECODED/
+  FLOORSWEPT），判定与地址着色（管道/`NO_COLOR` 退化为纯文本）。
+- 家族识别 Maxwell..Rubin（含 GA10x BOOT_0=0xb7xx00a1 怪癖）；FEAT 解锁
+  判定仅 Turing/Ampere/Ada 提供该簇映射的卡。
+- 对读数退化的卡按需经驱动自家 NVAPI GC6Control 唤醒 GC6/GCOFF 停泊卡
+  （笔记本实测）。
+- 驱动安全：`pmxdrv.sys`（Intel 签名、构建期 hash 钉死、启动期复验
+  fail-closed）**内嵌在 exe 里**，部署到自有服务名 `SSDIAG_PMXDRV`，
+  每条退出路径都停服务+删服务+删临时文件；绝不碰其他工具的服务。若
+  nvoc 等已部署 PMXDRV 设备则直接借用、零服务改动。部署路径需管理员
+  （借用已运行设备可免提权）。
+- 雷电口 eGPU：仅 rail 不掉电的环境下重apply 有意义（隧道重建≈热复位，
+  见上文雷电小节）。
+
+获取：v2.1.5 起 release zip 附带 `ssdiag-x86_64-windows.exe`；源码在
+`tools/ssdiag`（独立 crate，`cargo build --release` 即可重建，详见其
+`README.md`）。
 
 ## 构建
 
