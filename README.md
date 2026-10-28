@@ -1,4 +1,4 @@
-# nv-uefi-unlocker
+﻿# nv-uefi-unlocker
 
 [中文](README.md) | [English](README.en.md)
 
@@ -312,7 +312,7 @@ Blackwell（0x2bxx+）不在范围。
 | AD107 | 4060 Laptop **28e0** | ✅ 实测（本报告） |
 | AD107 | 4060 2882 / 4060 Laptop 28a0 / 4050M 28e1 | 🟢 上游硅验证（28e1 为 2.00× 实测报告） |
 | AD107 | 4050 Laptop **28a1** | ✅ 实测（2026-10-26，v0.1.3）：全链通过（WPR2 验证→booter marker→四写→选择器→签名还原→FLR 后 AON 存活）；FP16 tensor **22 → 38-42 TFLOPS（1.7-1.9×）**，完整性自检绿。门控值 `0xbadf1301` 走容毒回退 |
-| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ 实测**（PR #5，AD106 桌面：回放 + 解锁 + 四写读回，FP16 46.78→75.28 TFLOPS）；2805 🟢 上游硅验证 |
+| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ 实测**（PR #5，AD106 桌面：回放 + 解锁 + 四写读回，FP16 46.78→75.28 TFLOPS）；**2805 ✅ 实测**（[报告](docs/evidence/ad106-2805-nuc13/report.md)：ASUS `1043:8921` + Intel NUC13RNGi9，全链读回，FP16 45.78→75.24 TFLOPS，ComfyUI 稠密 bf16 ×1.57） |
 | AD106 | 4070 Laptop **2820**（魔改卡同 ID） | 🟡 路由已加（2026-10-28）：同 AD106 家族资产、与 2803 同 die 家族（上游表同样缺此 ID）。首次实机请按下文"不兼容/异常时"提交 `\loader.log` 全文，验证后再升级层级；**魔改卡另请附原卡型号与 VBIOS 版本** |
 | AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | 🟢 上游硅验证 |
 | AD103 | 4080S 2702 / 4080 2704 / 4070TiS 2705 / **4070 2709** / 4090M 2757 | **2709 ✅ 实测**（[issue #8](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/8)，B760 台式独显直连：四写全链读回、选择器穿 FLR；OS 侧 sm_89 mma 微基准 FP16 ~61→**123.91**、BF16 **118.90**、FP8 **243.55** TFLOPS，均 **2.0×**）；其余 🟢 上游硅验证 |
@@ -482,3 +482,4 @@ cargo xt                # 全部宿主测试（assets 19 + sim 44）
 
 许可：**GPL-2.0-only**（`LICENSE`）。NVIDIA 固件与 VBIOS 版权归 NVIDIA，按其
 原许可条款从钉版公开包本地再生，不在本仓库分发。
+
