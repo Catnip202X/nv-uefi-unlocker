@@ -29,6 +29,7 @@ compatible as of v2.1.0.** Support matrix:
   upstream-verified across the family (3060 / 2487, +58-85% with
   community tools). **30-series users do NOT need** the Turing
   GSP firmware-mode prerequisite.
+  Additional EFI reports cover 3080 (`2206`), 3070 Laptop (`249d`) and 3080 Ti Laptop (`2420`); see [community reports](docs/community-reports.md).
 - **RTX 40 series (Ada) ✅ verified** — RTX 4060 Laptop (`10de:28e0`,
   AD107M) four-write unlock, verified on both sides: firmware marker
   `0x67b00001` + the four PLM read-backs; Windows-side FP16 GEMM 29.89 →
@@ -46,7 +47,7 @@ mode — all different from Ada).
 
 | File | Purpose | Required |
 | --- | --- | --- |
-| `BOOTX64.EFI` | This tool (back up any existing file of that name first) | ✅ |
+| `\EFI\BOOT\BOOTX64.EFI` | This tool (back up any existing file at this path first) | ✅ |
 | `booter_load_ad102.bin` | AD102-family Booter bundle (BTL1) | ✅ |
 | `gsp_boot_ad102.bin` + `gsp_boot_desc_ad102.bin` | GSP-RM boot segment + v5 descriptor | ✅ |
 | `fwimage_ad102.bin` | GSP-RM firmware image (~80 MiB, radix3-loaded) | ✅ |
@@ -59,8 +60,10 @@ mode — all different from Ada).
 | `chain-target.txt` | Chain-target pin: the first non-empty, non-`#` line = an EFI path tried first (e.g. `\EFI\limine\limine_x64.efi`), on every volume; if no volume has it, the tool falls back to the default order with a loud log line (issue #8 suggestion) | optional |
 | `\loader.log` | (output) full stage log, the evidence record | output |
 
+The table uses the Ada asset names; choose `ga102` for GA10x or `tu10x` for Turing in the maker. Put `BOOTX64.EFI` at `\EFI\BOOT\BOOTX64.EFI`; put the selected family's `.bin` files and optional marker files at the stick root. The current maker emits a flat output directory, including intermediate extraction files: copy the family's files listed by its final `expected` list, and create `EFI/BOOT/` for the executable. Do not copy every intermediate firmware image.
+
 Without `v67-*.bin` the tool runs in **replay/diagnostic mode**: the full
-chain with zero unlock writes (a safe/forensic existence proof). The log
+chain without the unlock payload. It still detaches drivers, starts signed firmware and may reset the GPU; replay is a write transaction, not the read-only `cargo efi` build. The log
 line `family 'xxx' transaction track not enabled` means that chip family
 has no transaction track yet (all three of 20/30/40 are wired now; a card
 with missing assets is skipped). For a first run on a card not yet in the
@@ -84,7 +87,7 @@ other card silently takes its place).
    works only in the single entry path "restart, with the dGPU powered"
    (see the analysis for why).
 2. Boot from the stick → version banner → **press Space to confirm**
-   (30 s with no key automatically returns to Windows). If
+   (Enter or any other key aborts; 30 s with no key automatically returns to Windows). If
    `i_know_what_i_am_doing.txt` exists in the stick root (armed mode),
    the confirm phase becomes a **5-second countdown that then runs
    automatically**; any key during the countdown aborts. The file itself
@@ -398,7 +401,7 @@ persists, nothing is flashed, everything clears on power loss. Details:
 Judgement basis: this tool routes by **chip family** (all IDs of a family
 share the same Booter/payload assets, matching the upstream
 `ad102_family()`/GA10x routing). Tier meanings: ✅ verified here (full
-chain + payload on real silicon); 🟢 upstream silicon-verified (same
+chain + payload on real silicon, including attributed community reports); 🟢 upstream silicon-verified (same
 family proven on the kmod side, our EFI path is structurally identical —
 expected compatible); 🟡 path exists, unverified (code ready, no silicon
 evidence); ❌ incompatible.
@@ -419,15 +422,15 @@ Blackwell (0x2bxx+) is out of scope.
 | AD107 | 4060 Laptop **28e0** | ✅ verified (this report) |
 | AD107 | 4060 2882 / 4060 Laptop 28a0 / 4050M 28e1 | 🟢 upstream silicon-verified (28e1 has a 2.00× measured report) |
 | AD107 | 4050 Laptop **28a1** | ✅ verified (2026-10-26, v0.1.3): full chain on silicon (WPR2 verified → booter marker → four writes → selectors → signature restore → AON survival after FLR); FP16 tensor **22 → 38-42 TFLOPS (1.7-1.9×)**, integrity self-tests green; the gated `0xbadf1301` goes through the fallback |
-| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ verified** (PR #5, AD106 desktop: replay + unlock + four writes read back, FP16 46.78→75.28 TFLOPS); 2805 🟢 upstream silicon-verified |
+| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ verified** (PR #5, AD106 desktop: replay + unlock + four writes read back, FP16 46.78→75.28 TFLOPS); **2805 ✅ community-verified** ([report](docs/evidence/ad106-2805-nuc13/report.md), ASUS 1043:8921 + Intel NUC13RNGi9, v2.1.0): FP16 45.78→75.24, BF16 44.84→68.80 TFLOPS; FP32 control unchanged, 75 s load test |
 | AD106 | 4070 Laptop **2820** (same ID on modded cards) | 🟡 routed (2026-10-28): shares the AD106 family assets, same die family as 2803 (upstream's table lacks this ID too). First silicon run: post the full `\loader.log` per "When it does not work / misbehaves" below; the tier moves up only after that. **Modded cards: also include the original card model and VBIOS version** |
-| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | 🟢 upstream silicon-verified |
+| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | **2783 ✅ community-verified** ([issue #3](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/3), v0.1.4, Palit RTX 4070 SUPER + MSI B760 TOMAHAWK WIFI, 220 W): replay/unlock read-backs and FLR survival; 8192 GEMM FP16 70.5→100.1, BF16 71.0→107.0 TFLOPS. Other listed IDs retain upstream evidence |
 | AD103 | 4080S 2702 / 4080 2704 / 4070TiS 2705 / **4070 2709** / 4090M 2757 | **2709 ✅ verified** ([issue #8](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/8), B760 desktop dGPU-only: full four-write chain read back, selectors surviving FLR; OS-side sm_89 mma microbenchmark FP16 ~61→**123.91**, BF16 **118.90**, FP8 **243.55** TFLOPS — all **2.0×**); the rest 🟢 upstream silicon-verified |
 | AD102 | 4090 2684 / 4090D 2685 / 4070TiS 2689 | 🟢 upstream silicon-verified |
-| GA10x | 3090/3080 2204/2206, 3070s 2484–248c, 3060s 2501–2584 etc. (0x22xx/0x24xx/0x25xx fully open since 2026-10-28; the former 20c2/20f1 are GA100-class and have been removed) | **3060 Ti LHR 2489 ✅ verified** ([issue #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11), 2026-10-28, v2.1.0, @hunan-NRT): GA102-asset V67 chain passed the wait_plm verdict (PLM flip 0xffffff8f→0xffffffff read back, ~149 ms; SS0/SS1 written and read back 0x88888888/0x8, FEAT_READOUT_1=0) → clean Windows handoff; **AMD platform** (B450M Mortar + 5700X3D); card runs a flashed Inno3D iChill 3060 Ti VBIOS (cross-VBIOS is fine, FWSEC PROM reads normally). The rest of GA10x 🟡 kmod-verified upstream, no further silicon evidence on our EFI path yet (success-verdict fix traced in [issue #6](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6)) |
+| GA10x | 3090/3080 2204/2206, 3070s 2484–248c, 3060s 2501–2584 etc. (0x22xx/0x24xx/0x25xx fully open since 2026-10-28; the former 20c2/20f1 are GA100-class and have been removed) | **3060 Ti LHR 2489 ✅ verified** ([issue #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11), 2026-10-28, v2.1.0, @hunan-NRT): GA102-asset V67 chain passed the wait_plm verdict (PLM flip 0xffffff8f→0xffffffff read back, ~149 ms; SS0/SS1 written and read back 0x88888888/0x8, FEAT_READOUT_1=0) → clean Windows handoff; **AMD platform** (B450M Mortar + 5700X3D); card runs a flashed Inno3D iChill 3060 Ti VBIOS (cross-VBIOS is fine, FWSEC PROM reads normally). Additional EFI reports: **2206 / 249d / 2420 ✅ community-verified** (v2.1.0; [results and platform limits](docs/community-reports.md)). Other same-family cards remain compatible; these are the individually documented EFI results (success-verdict fix traced in [issue #6](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6)) |
 | **TU106** | **RTX 2070 1f07 / 2060 Super 1f06** | **1f07 ✅ verified** (2026-10-27, v0.2.0): full chain (FWSEC ignite → BOOT_DIRECT booter → V67 fire → PLM 0x409650 fully open → SS0/SS1 written+read back → signature restore); **FP32-accum 36 → 60-63 TFLOPS (+67-75%)**. **Prerequisite: Windows-side GSP firmware mode (section below), RESTART to apply**. Measured host: Intel 10980HK ES (QTJ1) + 2070 hybrid-output desktop platform; **hibernate-resume → stick unlock write → Windows verification passed**. **1f06 ✅ verified** ([issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12), 2026-10-27, v0.2.0, @vadash): full chain (FWSEC → WPR2 verified → BOOT_DIRECT booter → PLM fully open → SS0/SS1 written+read back 0x88888888/0x8 → signature restore → unlock values persist through the PLM relock → FLR skipped per semantics) → clean Windows handoff; **AMD platform** (AM4/Promontory, the bridge-BME fix path exercised); 8 GB SKU shares the 8192 MiB geometry table with the 2070 (other TU106 capacities need the table extended first) |
 | TU102/TU104/TU116 (rest of the 20/16 series) | 1e02–1fff, 2182–21d1 etc. | 🟢 same-family assets + community silicon proof (2080Ti 22G chenxluo +51-75%, 2080Ti 11G nlzy/haohervchb ~1.6×, same chain) |
-| Turing and older (Pascal…) | — | ❌ no transaction track |
+| Older than Turing (Pascal…) | — | ❌ no transaction track |
 | Blackwell (50 series) / GA100 | — | ❌ different chain, out of scope |
 
 ## Turing (20 series) prerequisite: GSP firmware mode (must read)
@@ -563,6 +566,8 @@ docs/      reports, milestone evidence (evidence-as-commits), register cold-valu
 
 ## Safety constitution (copy, equivalent to AGENTS.md §1; violating any single item stops the work)
 
+The loader currently records PROM CRC32 fingerprints. Per-card ROM/PROM SHA-256 pinning, required below, is pending; see [implementation status](docs/community-reports.md#使用说明与实现边界).
+
 1. **Read-back is the only success criterion.** Status codes, return
    values, interrupts and self-test output never count as proof of
    execution.
@@ -615,7 +620,7 @@ permanent damage).
 cargo build --release   # host crates (assets/sim) — the loader is not in default-members
 cargo efi               # read-only EFI build (M0/M1 diagnostics)
 cargo efi-tx            # gated transaction build (write paths; explicit use only)
-cargo xt                # all host tests (assets 19 + sim 44)
+cargo xt                # all host tests (assets + sim; see current test output for counts)
 ```
 
 A bare `cargo build --workspace` tries to build the loader for the host
