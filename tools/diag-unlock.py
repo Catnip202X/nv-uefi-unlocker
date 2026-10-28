@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""NVIDIA unlock state reader / re-applier (host-OS side, Linux).
+
+Reads the FEAT cluster straight off BAR0 via sysfs (no driver needed):
+mmap /sys/bus/pci/devices/<bdf>/resource0 and read dwords. Root required.
+
+Families (PMC_BOOT_0 bits [31:20]):
+  Turing  (0x160..0x16F)  FEAT_PLM 0x00409650 / SS0 0x00409664 / SS1 0x0040966C
+  Ampere/Ada (0x170..0x17F, 0x220..0x22F, 0x100)  0x00823804 / 0x0082381C / 0x00823820
+  (+ READOUT_1 0x00823818 on the 0x823xxx block; unknown on Turing)
+
+Why this exists (issue #6): the EFI unlock's volatile state is only useful if
+it survives into the OS. This tool answers, from inside the running system:
+  - did the SS override values persist?           (unlock state)
+  - is the FEAT PLM gate still open?              (re-apply possible?)
+`--reapply` rewrites SS0/SS1 while the door is open - the "separate-lock"
+method: devinit may re-derive the rates from fuses (it holds L3), but with
+the gate left open by the EFI chain the host can simply write them again.
+
+Usage:
+  sudo python3 diag-unlock.py                 # read all NVIDIA dGPUs
+  sudo python3 diag-unlock.py --bdf 0000:01:00.0
+  sudo python3 diag-unlock.py --reapply       # SS0=0x88888888 SS1=0x8 when open
+"""
+
+import argparse
+import mmap
+import os
+import sys
+
+SS0_UNLOCK = 0x8888_8888
+SS1_UNLOCK = 0x8
+
+# offset -> name, per family
+TURING = {"plm": 0x0040_9650, "ss0": 0x0040_9664, "ss1": 0x0040_966C}
+GAADA = {
+    "plm": 0x0082_3804,
+    "ss0": 0x0082_381C,
+    "ss1": 0x0082_3820,
+    "readout": 0x0082_3818,
+}
+
+
+def find_gpus():
+    out = []
+    root = "/sys/bus/pci/devices"
+    for bdf in sorted(os.listdir(root)):
+        p = os.path.join(root, bdf)
+        try:
+            vendor = open(os.path.join(p, "vendor")).read().strip()
+            cls = open(os.path.join(p, "class")).read().strip()
+        except OSError:
+            continue
+        if vendor != "0x10de" or not cls.startswith("0x03"):
+            continue
+        # function 0 only (the GPU, not its audio/USB-C companions)
+        if ".0" not in bdf and "0000:" in bdf and not bdf[-2] == ".":
+            continue
+        out.append((bdf, p))
+    return out
+
+
+class Bar0:
+    def __init__(self, devpath):
+        with open(os.path.join(devpath, "resource")) as f:
+            start = int(f.readline().split()[0], 16)
+        if start == 0:
+            raise RuntimeError("BAR0 not assigned (device powered down?)")
+        self.start = start
+        f = open(os.path.join(devpath, "resource0"), "r+b", 0)
+        self.map = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+
+    def rd(self, off):
+        return int.from_bytes(self.map[off : off + 4], "little")
+
+    def wr(self, off, val):
+        self.map[off : off + 4] = int.to_bytes(val, 4, "little")
+
+
+def family_of(boot0):
+    die = (boot0 >> 20) & 0xFFF
+    if 0x160 <= die <= 0x16F:
+        return "turing", TURING
+    if 0x170 <= die <= 0x17F or 0x220 <= die <= 0x22F or die == 0x100:
+        return "ampere/ada", GAADA
+    return None, None
+
+
+def decode_plm(v):
+    if v == 0xFFFF_FFFF:
+        return "OPEN"
+    if v == 0xFFFF_FF8F:
+        return "closed (stock)"
+    if v == 0xFFFF_FFEF:
+        return "closed (relock+drift)"
+    return "closed (non-standard)"
+
+
+def decode_ss(v, width):
+    # 4-bit fields: bit3 = override-enable, bits[2:0] = rate (0 full 1 half 2 quarter 3 eighth)
+    names = {0: "full", 1: "1/2", 2: "1/4", 3: "1/8"}
+    fields = []
+    for i in range(width):
+        nib = (v >> (4 * i)) & 0xF
+        if nib == 0:
+            fields.append(".")
+        elif nib & 0x8:
+            fields.append(names.get(nib & 7, "?") + "*")
+        else:
+            fields.append("r%d" % (nib & 7))
+    return " ".join(fields)
+
+
+def report(bar, tag=""):
+    boot0 = bar.rd(0x0)
+    fam, regs = family_of(boot0)
+    if fam is None:
+        print(f"  PMC_BOOT_0={boot0:#010x} - unsupported chip, skip")
+        return None
+    plm = bar.rd(regs["plm"])
+    ss0 = bar.rd(regs["ss0"])
+    ss1 = bar.rd(regs["ss1"])
+    print(f"  PMC_BOOT_0={boot0:#010x} family={fam} {tag}")
+    print(f"  FEAT_PLM  = {plm:#010x} ({decode_plm(plm)})")
+    print(f"  FEAT_SS0  = {ss0:#010x} [{decode_ss(ss0, 8)}]")
+    print(f"  FEAT_SS1  = {ss1:#010x} [{decode_ss(ss1, 1)}]")
+    if "readout" in regs:
+        ro = bar.rd(regs["readout"])
+        note = "PLM-blocked" if (ro & 0xFFFF0000) == 0xBADF0000 else ("full speed" if ro == 0 else "")
+        print(f"  READOUT_1 = {ro:#010x} {note}")
+    unlocked = ss0 == SS0_UNLOCK and ss1 == SS1_UNLOCK
+    print(f"  VERDICT: {'UNLOCKED (override values live)' if unlocked else 'not unlocked'}"
+          f"{' - reapply available (door open)' if not unlocked and plm == 0xFFFF_FFFF else ''}")
+    return fam, regs, plm, unlocked
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bdf", help="only this PCI address, e.g. 0000:01:00.0")
+    ap.add_argument("--reapply", action="store_true",
+                    help="write SS0=0x88888888 SS1=0x8 where the PLM gate is open")
+    args = ap.parse_args()
+
+    if os.geteuid() != 0:
+        print("root required (sysfs BAR0 mmap)", file=sys.stderr)
+        return 2
+
+    devs = find_gpus()
+    if args.bdf:
+        devs = [(b, p) for (b, p) in devs if b.endswith(args.bdf) or b.split(":")[-1] == args.bdf.split(":")[-1]]
+    if not devs:
+        print("no NVIDIA display controller found", file=sys.stderr)
+        return 1
+
+    rc = 0
+    for bdf, devpath in devs:
+        print(f"{bdf}:")
+        try:
+            bar = Bar0(devpath)
+        except (PermissionError, RuntimeError) as e:
+            print(f"  BAR0 unavailable: {e}")
+            rc = 1
+            continue
+        st = report(bar)
+        if st is None:
+            continue
+        fam, regs, plm, unlocked = st
+        if args.reapply:
+            if plm != 0xFFFF_FFFF:
+                print("  reapply REFUSED: FEAT PLM gate is closed - the EFI chain owns door-opening;"
+                      " re-run the USB unlock instead")
+                rc = 1
+            else:
+                bar.wr(regs["ss0"], SS0_UNLOCK)
+                bar.wr(regs["ss1"], SS1_UNLOCK)
+                rb0, rb1 = bar.rd(regs["ss0"]), bar.rd(regs["ss1"])
+                ok = rb0 == SS0_UNLOCK and rb1 == SS1_UNLOCK
+                print(f"  reapply: SS0={rb0:#010x} SS1={rb1:#010x} -> {'OK' if ok else 'READBACK MISMATCH'}"
+                      " (read-back is the only success criterion)")
+                rc = 0 if ok else 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

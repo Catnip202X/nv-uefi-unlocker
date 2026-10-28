@@ -1,0 +1,19 @@
+[package]
+name = "ssdiag"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "In-OS NVIDIA FEAT-cluster (PLM/SS0/SS1) reader / re-applier over the pmxdrv physical-memory transport"
+
+# Detached from the repo-root workspace on purpose (standalone host tool).
+[workspace]
+
+[[bin]]
+name = "ssdiag"
+path = "main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+panic = "abort"
