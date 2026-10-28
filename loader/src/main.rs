@@ -49,12 +49,12 @@ fn main() -> Status {
     }
     banner::print(VERSION);
 
-    // Phase: CONFIRM. TX builds: ONLY Space proceeds - timeout or any other
-    // key aborts into chain-load with zero GPU writes (issue #4.1: the old
-    // code proceeded on any key AND on timeout, so a stick left in a machine
-    // could run the transaction unattended). Read-only builds keep the M0
-    // semantics. Armed mode (marker file on the stick root) inverts this:
-    // a 5s countdown auto-proceeds, any key aborts - the file is the
+    // Phase: CONFIRM. TX builds: ONLY Space or Enter proceeds - timeout or
+    // any other key aborts into chain-load with zero GPU writes (issue #4.1:
+    // the old code proceeded on any key AND on timeout, so a stick left in a
+    // machine could run the transaction unattended). Read-only builds keep
+    // the M0 semantics. Armed mode (marker file on the stick root) inverts
+    // this: a 5s countdown auto-proceeds, any key aborts - the file is the
     // operator's explicit declaration of intent, so unattended runs are
     // opt-in per stick, never a default.
     let confirmed = if chainload::boot_volume_has(ARMED_MARKER) {
@@ -63,7 +63,7 @@ fn main() -> Status {
         );
         keywait::wait_confirm_armed(ARMED_WAIT)
     } else {
-        info!("CONFIRM: no armed marker - Space/{CONFIRM_WAIT}s confirm semantics");
+        info!("CONFIRM: no armed marker - Space/Enter/{CONFIRM_WAIT}s confirm semantics");
         keywait::wait_confirm(CONFIRM_WAIT)
     };
 
