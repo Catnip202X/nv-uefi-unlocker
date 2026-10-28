@@ -110,3 +110,27 @@ fn scenario_09_sec2_halt_no_plm() {
     assert!(write_verified(&mut gpu, regs::FEAT_SS0, 0x8888_8888).is_err());
     assert_eq!(gpu.read(regs::FEAT_SS0), 0x0000_0001);
 }
+
+/// Privilege-model regression: while FEAT_OVR_PLM reads the locked baseline,
+/// a HOST write must be dropped for the whole PLM-protected block - including
+/// the gate register itself. "Just write 0x823804 from the host" is the one
+/// implementation the silicon refuses outright, and the model has to refuse it
+/// too or M2 stops being a gate.
+#[test]
+fn scenario_10_host_write_to_plm_block_is_dropped_while_locked() {
+    let mut gpu = FakeGpu::new_locked_cold(None);
+    gpu.write(regs::FEAT_PLM, 0xffff_ffff);
+    assert_eq!(gpu.read(regs::FEAT_PLM), 0xffff_ff8f, "host write to FEAT_OVR_PLM must be dropped");
+    for (name, off) in [
+        ("WPRCFG", regs::WPRCFG_PLM),
+        ("FBPA", regs::FBPA_PLM),
+        ("WPR", regs::WPR_PLM),
+    ] {
+        gpu.write(off, 0xdead_beef);
+        assert_ne!(gpu.read(off), 0xdead_beef, "{name} must be dropped while the mask is locked");
+    }
+    // Payload side (heavy-secure) opens the mask; host writes then land.
+    gpu.force_write(regs::FEAT_PLM, 0xffff_ffff);
+    gpu.write(regs::FEAT_SS0, 0x8888_8888);
+    assert_eq!(gpu.read(regs::FEAT_SS0), 0x8888_8888, "selectors accept the host write once the mask is open");
+}
