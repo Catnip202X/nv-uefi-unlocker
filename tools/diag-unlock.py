@@ -107,11 +107,21 @@ class Bar0:
 
 
 def family_of(boot0):
+    # die = bits [31:20]; nvchip series per open-gpu-kernel-modules nv_arch.h
+    # (GP104=NV124, GA102F=NV17F, AD107=NV197 - field-confirmed on 1f07/AD106)
     die = (boot0 >> 20) & 0xFFF
+    if 0x120 <= die <= 0x12F:
+        return "pascal", None
+    if 0x130 <= die <= 0x13F:
+        return "volta", None
     if 0x160 <= die <= 0x16F:
         return "turing", TURING
-    if 0x170 <= die <= 0x17F or 0x220 <= die <= 0x22F or die == 0x100:
-        return "ampere/ada", GAADA
+    if 0x170 <= die <= 0x17F:
+        return "ampere/ga100", GAADA
+    if 0x190 <= die <= 0x19F:  # Ada is NV19x, NOT 0x22x (device ids)
+        return "ada", GAADA
+    if 0x090 <= die <= 0x09F or 0x1A0 <= die <= 0x1AF:
+        return "hopper/blackwell", None
     return None, None
 
 
@@ -144,7 +154,14 @@ def report(bar, tag=""):
     boot0 = bar.rd(0x0)
     fam, regs = family_of(boot0)
     if fam is None:
-        print(f"  PMC_BOOT_0={boot0:#010x} - unsupported chip, skip")
+        if boot0 in (0, 0xFFFFFFFF):
+            state = "all zeros" if boot0 == 0 else "all ones"
+            print(f"  PMC_BOOT_0={boot0:#010x} [{state}] - device likely D3 / MEM decode off; nothing to diagnose")
+        else:
+            print(f"  PMC_BOOT_0={boot0:#010x} - NVIDIA-class unknown die; diagnosis-only pass (FEAT addresses unmapped)")
+        return None
+    if regs is None:
+        print(f"  VERDICT: family recognized - FEAT addresses not mapped for this family (diagnosis only)")
         return None
     plm = bar.rd(regs["plm"])
     ss0 = bar.rd(regs["ss0"])

@@ -517,16 +517,32 @@ fn badf_bucket(v: u32) -> Option<&'static str> {
     })
 }
 
+/// Die id = PMC_BOOT_0 bits [31:20]; nvchip series per open-gpu-kernel-modules
+/// nv_arch.h implementation numbers (GP104=NV124, GA102F=NV17F, AD107=NV197 -
+/// the latter two confirmed against 1f07/AD106/AD107 field reads).
 fn family_of(boot0: u32) -> Option<(&'static str, &'static [(&'static str, u32)])> {
     let die = (boot0 >> 20) & 0xFFF;
-    if (0x160..=0x16F).contains(&die) {
+    if (0x120..=0x12F).contains(&die) {
+        Some(("pascal", &FEAT_NONE))
+    } else if (0x130..=0x13F).contains(&die) {
+        Some(("volta", &FEAT_NONE))
+    } else if (0x160..=0x16F).contains(&die) {
         Some(("turing", &FEAT_TURING))
-    } else if (0x170..=0x17F).contains(&die) || (0x220..=0x22F).contains(&die) || die == 0x100 {
-        Some(("ampere/ada", &FEAT_AMPADA))
+    } else if (0x170..=0x17F).contains(&die) {
+        Some(("ampere/ga100", &FEAT_AMPADA))
+    } else if (0x190..=0x19F).contains(&die) {
+        // Ada is NV19x (AD106 field read 0x196000a1) - NOT 0x22x (device ids)
+        Some(("ada", &FEAT_AMPADA))
+    } else if (0x090..=0x09F).contains(&die) || (0x1A0..=0x1AF).contains(&die) {
+        Some(("hopper/blackwell", &FEAT_NONE))
     } else {
         None
     }
 }
+
+/// Families whose FEAT-cluster addresses we have not mapped: diagnosis
+/// proceeds, the verdict degrades to a family note.
+const FEAT_NONE: [(&str, u32); 0] = [];
 
 fn decode_plm(v: u32) -> &'static str {
     match v {
@@ -734,7 +750,9 @@ fn run() -> i32 {
         for (a, b) in &g.ranges {
             println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
         }
-        // walk candidates smallest-size first; the PMC sanity read arbitrates
+        // walk candidates smallest-size first; the PMC sanity read arbitrates.
+        // A non-degenerate BOOT_0 on an unknown die still wins the walk as a
+        // fallback (diagnosis-only) - the die table must not veto a card.
         let mut picked: Option<(u64, u64, u32)> = None; // (bar0, va, boot0)
         for bar0 in g.bar0_candidates() {
             const PAGES: u32 = 4096; // 16 MiB BAR0
@@ -748,14 +766,35 @@ fn run() -> i32 {
             };
             let boot0 =
                 unsafe { ((va as *const u8).add(0) as *const u32).read_volatile() };
+            if boot0 == 0xFFFF_FFFF || boot0 == 0 {
+                // BAR decodes but reads degenerate: device likely D3 / MEM
+                // decode off / driver unbound. Keep as last-resort evidence.
+                if picked.is_none() {
+                    picked = Some((bar0, va, boot0));
+                } else {
+                    drv.unmap_physical(va);
+                }
+                continue;
+            }
             match family_of(boot0) {
                 Some(_) => {
+                    if let Some((_, old_va, _)) = picked {
+                        drv.unmap_physical(old_va);
+                    }
                     picked = Some((bar0, va, boot0));
                     break;
                 }
                 None => {
-                    // not a PMC (e.g. the ReBAR aperture reads 0) - unmap, try next
-                    drv.unmap_physical(va);
+                    // unknown NVIDIA-class die: remember the first, keep
+                    // looking for a known one
+                    if let Some((_, old_va, old_b)) = picked {
+                        if old_b != 0 && old_b != 0xFFFF_FFFF {
+                            drv.unmap_physical(va);
+                            continue;
+                        }
+                        drv.unmap_physical(old_va);
+                    }
+                    picked = Some((bar0, va, boot0));
                 }
             }
         }
@@ -766,15 +805,36 @@ fn run() -> i32 {
         };
         println!("BAR0: {bar0:#x}");
 
+        if boot0 == 0xFFFF_FFFF || boot0 == 0 {
+            drv.unmap_physical(va);
+            println!(
+                "BAR0 reads {} - device likely D3 / MEM decode disabled / driver unbound; nothing to diagnose",
+                if boot0 == 0 { "all zeros" } else { "all ones" }
+            );
+            rc = 1;
+            continue;
+        }
+
         let base = va as *const u8;
         let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
         let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
 
         let Some((fam_name, regs)) = family_of(boot0) else {
-            unreachable!("picked candidates are family-validated");
+            println!("PMC_BOOT_0={boot0:#010x} - NVIDIA-class but unknown die; diagnosis-only pass (FEAT addresses unmapped for this family)");
+            dump_debug(&rd);
+            drv.unmap_physical(va);
+            rc = 1;
+            continue;
         };
         dump_debug(&rd);
 
+        if regs.is_empty() {
+            println!(
+                "VERDICT [{fam_name}]: family recognized - FEAT addresses not mapped for this family (diagnosis only)"
+            );
+            drv.unmap_physical(va);
+            continue;
+        }
         let get = |name: &str| regs.iter().find(|(n, _)| *n == name).unwrap().1;
         let plm = rd(get("PLM"));
         let ss0 = rd(get("SS0"));
