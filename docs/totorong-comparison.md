@@ -1,6 +1,6 @@
 # TOTORONG AD103_win_unlocker 对照（2026-10-26，仓库 51df9c1）
 
-> 状态补注（2026-10-28）：本表是当时的实现对照，“1:1 移植”不表示每条保留代码均在真机执行。当前 loader 使用 portal 装载；逐卡 ROM/PROM SHA-256 拒绝门仍未实现，见[实现边界](community-reports.md#使用说明与实现边界)。
+> 状态补注（2026-10-28）：当前 loader 使用 portal 装载，Falcon DMA 代码保留作实验。逐卡 ROM/PROM SHA-256 校验待实现，见[实现边界](community-reports.md#使用说明与实现边界)。下表保留 2026-10-26 的实现对照。
 
 对象：`reference/AD103_win_unlocker`（Windows UEFI 预驱动解锁的唯一先例，
 RTX 4080 AD103 32GB 单卡实验）。结论：**链形状与我们同源且一致**（他们的

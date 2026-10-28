@@ -566,7 +566,7 @@ docs/      reports, milestone evidence (evidence-as-commits), register cold-valu
 
 ## Safety constitution (copy, equivalent to AGENTS.md §1; violating any single item stops the work)
 
-The following items are project requirements. The current loader logs a PROM CRC32 fingerprint but does not enforce per-card ROM/PROM SHA-256 pinning. See [implementation limits](docs/community-reports.md#使用说明与实现边界); the policy is not a claim that every gate is implemented.
+The loader currently records PROM CRC32 fingerprints. Per-card ROM/PROM SHA-256 pinning, required below, is pending; see [implementation status](docs/community-reports.md#使用说明与实现边界).
 
 1. **Read-back is the only success criterion.** Status codes, return
    values, interrupts and self-test output never count as proof of

@@ -1,6 +1,6 @@
 # 寄存器冷值表（M1 采样产出，按族分节）
 
-> 勘误（2026-10-28）：TU106 表中 13/13 BADF 指 `0x823xxx`，不能证明 Turing 真 FEAT 块全锁；其真地址为 PLM `0x409650`、SS0 `0x409664`、SS1 `0x40966c`，部分后续采样可读。CRC32 仅是记录指纹，尚无逐卡 SHA-256 拒绝门。28e1 的 IOMMU 归因已由[桥 BME 根因](bridge-bme-root-cause.md)更正；表尾 WPR2 lo/hi=0/0 是旧任务书值，实测冷态空窗口为 lo=`0x1ffffe00`、hi=0。原始采样值保留。
+> 勘误（2026-10-28）：TU106 表中的 13/13 BADF 来自 `0x823xxx`；Turing 真 FEAT 地址是 PLM `0x409650`、SS0 `0x409664`、SS1 `0x40966c`，后续部分样本在这些地址可读。CRC32 为采样指纹，逐卡 SHA-256 校验待实现。28e1 的 0x89 现已定位为[桥 BME 问题](bridge-bme-root-cause.md)。表尾 WPR2 lo/hi=0/0 来自旧任务书，实测冷态空窗口为 lo=`0x1ffffe00`、hi=0。表中原始采样值保留。
 
 > 每次实机采样后把 `\loader.log` 的 SAMPLE 段誊入对应节，保留原始日志于
 > `docs/evidence/m1-<machine>/`。冷值=驱动加载前（UEFI 阶段）读回值。

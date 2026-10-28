@@ -434,7 +434,7 @@ docs/      报告、里程碑证据（evidence-as-commits）、寄存器冷值�
 
 ## 安全宪法（副本，与 AGENTS.md §1 等义，违反任何一条即停工）
 
-以下是项目约束。当前 loader 记录 PROM CRC32 指纹，尚未实现逐卡 ROM/PROM SHA-256 拒绝门；详见[实现边界](docs/community-reports.md#使用说明与实现边界)。约束仍然有效，不应据此误认所有门控均已实现。
+当前 loader 记录 PROM CRC32 指纹；下列要求中的逐卡 ROM/PROM SHA-256 校验待实现，详见[实现进度](docs/community-reports.md#使用说明与实现边界)。
 
 1. **读回是唯一成功判据**。状态码/返回值/中断/自检输出一律不构成执行证明。
 2. **STOP/异常后同会话绝不重试**；完全断电后走正常 Windows 引导恢复。
