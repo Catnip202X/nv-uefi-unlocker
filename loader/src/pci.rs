@@ -35,6 +35,45 @@ pub fn set_high_staging(on: bool) {
     TX_HIGH_STAGING.store(on, core::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(feature = "tx")]
+static MEMMAP_CAPTURED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Capture the memory map once per boot - every descriptor ending at/above
+/// 2 GiB, ALL types, not just conventional: what the firmware did with the
+/// high RAM is the open question behind the per-board 0x91 differences
+/// (issues #16/#17/#19). Runs before the first allocation so it lands in
+/// every log, success or failure.
+#[cfg(feature = "tx")]
+fn capture_memmap_once() {
+    if MEMMAP_CAPTURED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mmap) = boot::memory_map(MemoryType::BOOT_SERVICES_DATA) else {
+        info!("MEMMAP: capture failed");
+        return;
+    };
+    let mut lines = 0u32;
+    let mut above4g = 0u32;
+    for d in mmap.entries() {
+        let end = d.phys_start.saturating_add((d.page_count as u64) * 4096);
+        if d.ty == MemoryType::CONVENTIONAL && d.phys_start >= 0x1_0000_0000 {
+            above4g += 1;
+        }
+        if end >= 0x8000_0000 && lines < 32 {
+            info!(
+                "MEMMAP: {:#x}-{:#x} ({} MiB) type={:?} attr={:?}",
+                d.phys_start,
+                end,
+                ((d.page_count as u64) * 4096) >> 20,
+                d.ty,
+                d.att
+            );
+            lines += 1;
+        }
+    }
+    info!("MEMMAP: {above4g} conventional descriptors above 4GB");
+}
+
 /// EFI_PCI_IO_PROTOCOL_WIDTH (only the fixed-width variants are named here).
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)] // Uint64 arrives with M1 BAR0 64-bit reads
@@ -294,6 +333,7 @@ impl PciIo {
     /// through legal coherent memory types before giving up.
     #[cfg(feature = "tx")]
     pub fn dma_alloc(&self, len: usize) -> Result<DmaBuffer, Status> {
+        capture_memmap_once();
         // Above-4GB staging first, gated per family (see set_high_staging):
         // issues #14/#16 (2026-10-28) - the booter's first host DMA pulls
         // the WprMeta into SEC2 DMEM, and on some Turing cards a sub-4GB
@@ -428,32 +468,10 @@ impl PciIo {
                 break;
             }
         }
-        // Map forensics for the field report (issue #17: "EFI memory map not
-        // yet captured"): every descriptor ending at/above 2 GiB - ALL
-        // types, not just conventional, because what the firmware did with
-        // the high RAM is the open question behind the per-board 0x91
-        // differences (issues #16/#17/#19).
-        let mut above4g = 0u32;
-        let mut lines = 0u32;
-        for d in mmap.entries() {
-            let end = d.phys_start.saturating_add((d.page_count as u64) * 4096);
-            if d.ty == MemoryType::CONVENTIONAL && d.phys_start >= FOUR_GB {
-                above4g += 1;
-            }
-            if end >= 0x8000_0000 && lines < 32 {
-                info!(
-                    "MEMMAP: {:#x}-{:#x} ({} MiB) type={:?} attr={:?}",
-                    d.phys_start,
-                    end,
-                    ((d.page_count as u64) * 4096) >> 20,
-                    d.ty,
-                    d.att
-                );
-                lines += 1;
-            }
-        }
+        // Full map picture is already captured once per boot (capture_memmap_once,
+        // called from dma_alloc before any allocation).
         info!(
-            "DMA alloc: no usable >4GB conventional space (candidates={candidates} failed={failed}, {above4g} conventional descriptors above 4GB)"
+            "DMA alloc: no usable >4GB conventional space (candidates={candidates} failed={failed})"
         );
         Err(Status::NOT_FOUND)
     }

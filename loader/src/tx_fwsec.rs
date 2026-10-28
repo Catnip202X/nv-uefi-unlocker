@@ -331,10 +331,27 @@ pub fn layout_from_registers(
     let fb_mib = if inaccessible(fb_raw) {
         if family == "tu10x" {
             const FB_MIB_TU106_1F07: u32 = 8192;
-            info!(
-                "layout: FB_SIZE_MIB PLM-locked on Turing ({fb_raw:#010x}) - using SKU geometry 8192 MiB (10de:1f07); refuse and extend the table for other TU106 SKUs"
-            );
-            FB_MIB_TU106_1F07
+            // \tu10x-fb-gb.txt override (issue #17): floorswept/modded cards
+            // (TU102 22528 MiB class) run a FB geometry the SKU table does
+            // not know, and the booter validates the WprMeta against the
+            // live FB size - a wrong table value is a 0x91. Plain decimal
+            // GiB; everything downstream (vga/frts/wpr/heap table) keys off
+            // this one number.
+            let override_mib = crate::tx::read_boot_file("\\tu10x-fb-gb.txt")
+                .and_then(|b| core::str::from_utf8(&b).ok().map(str::trim).and_then(|s| s.parse::<u64>().ok()))
+                .filter(|g| *g >= 1 && *g <= 64);
+            match override_mib {
+                Some(gib) => {
+                    info!("layout: \\tu10x-fb-gb.txt override: FB size = {gib} GiB (SKU table skipped)");
+                    (gib * 1024) as u32
+                }
+                None => {
+                    info!(
+                        "layout: FB_SIZE_MIB PLM-locked on Turing ({fb_raw:#010x}) - using SKU geometry 8192 MiB (10de:1f07); refuse and extend the table for other TU106 SKUs"
+                    );
+                    FB_MIB_TU106_1F07
+                }
+            }
         } else {
             return Err(TxError::EIO);
         }
