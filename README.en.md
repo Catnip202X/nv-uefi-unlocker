@@ -575,6 +575,28 @@ sysmem; switching the FBIF TARGET has no effect), see
 > SVM/VT-x; the bridge Bus Master bit is PCI Command Register bit 2 and
 > has nothing to do with "Virtualization".
 
+### Known issue (fixed in the loader): AMI pathless GOP child resets the platform after a successful transaction
+
+**Symptom**: the whole transaction is green (`MAILBOX0=0x67b00001`, PLM read-backs,
+`POST-FLR: verified`), then the PC resets or hangs on a black screen before Windows starts. Releases
+before v2.1.5 left `loader.log` at 0 bytes in this case, because the log was only flushed right
+before the chain-load.
+
+**Root cause** (PR #13, found on an ASUS ROG MAXIMUS Z790 APEX + RTX 4060 Ti 8 GB): this AMI firmware
+layers a **GOP child with no device path** (a firmware splitter/console handle) on top of the NVIDIA
+GOP. The detach removes the NVIDIA GOP, but the pathless child survives. A **recursive**
+`ConnectController` then re-binds the console stack over that stale child, and the platform resets
+inside the call. Two places did this: `reconnect_all` right after the post-FLR verdict, and the
+`map -r`-style pass in `chain_load_bootmgfw`, which reconnected every PciIo handle including the GPU.
+
+**Fix**: built into the loader (PR #13; node-aligned GOP ownership in `fe92339`). The reconnect stays
+recursive by default (single-GOP boards are unchanged) and connects the vendor GOP only when a
+pathless GOP survived the detach; the pre-chain pass skips NVIDIA display functions; `loader.log` is
+flushed during the run. On an affected board the log shows
+`RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)`, and `\no-reconnect.txt`
+skips the reconnect entirely if a board still misbehaves. Evidence: `docs/evidence/ad106-asus-z790/`,
+write-up `docs/ad106-asus-z790-windows-unlock.md`.
+
 > The maintainer works on this **part-time** and may not see or answer
 > issues immediately — the logs are kept and will be reviewed; patience
 > appreciated.
