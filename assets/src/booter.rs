@@ -51,9 +51,9 @@ pub fn build_bundle(source_text: &str) -> Result<Vec<u8>, BooterError> {
     if header.len() != 36 || patch_loc.len() != 4 || patch_meta.len() != 12 || num_sigs.len() != 4 {
         return Err(BooterError::UnexpectedRecordSize);
     }
-    let fields: Vec<u32> = header.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let fields: Vec<u32> = header.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let loc = u32::from_le_bytes(patch_loc.try_into().unwrap());
-    let meta: Vec<u32> = patch_meta.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let meta: Vec<u32> = patch_meta.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let (_fuse, engine, ucode) = (meta[0], meta[1], meta[2]);
     let count = u32::from_le_bytes(num_sigs.try_into().unwrap());
 
@@ -102,7 +102,7 @@ pub fn build_gsp_boot(source_text: &str) -> Result<(Vec<u8>, Vec<u8>), BooterErr
     if desc.len() != 84 {
         return Err(BooterError::UnsupportedBootloaderDescriptor);
     }
-    let fields: Vec<u32> = desc.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let fields: Vec<u32> = desc.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     if fields[0] != 5 || fields[14] != 1 || fields[19] != image.len() as u32 || fields[20] != 0 {
         return Err(BooterError::UnsupportedBootloaderDescriptor);
     }
@@ -131,9 +131,9 @@ pub fn build_bundle_direct(source_text: &str) -> Result<Vec<u8>, BooterError> {
     if header.len() != 36 || patch_loc.len() != 4 || patch_meta.len() != 12 || num_sigs.len() != 4 || patch_sig.len() != 4 {
         return Err(BooterError::UnexpectedRecordSize);
     }
-    let fields: Vec<u32> = header.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let fields: Vec<u32> = header.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let loc = u32::from_le_bytes(patch_loc.try_into().unwrap());
-    let meta: Vec<u32> = patch_meta.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let meta: Vec<u32> = patch_meta.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     let (_fuse, engine, ucode) = (meta[0], meta[1], meta[2]);
     let count = u32::from_le_bytes(num_sigs.try_into().unwrap());
     if u32::from_le_bytes(patch_sig.try_into().unwrap()) != 0 {
@@ -186,7 +186,7 @@ pub fn build_gsp_boot_v4(source_text: &str) -> Result<(Vec<u8>, Vec<u8>), Booter
     if desc.len() != 76 {
         return Err(BooterError::UnsupportedBootloaderDescriptor);
     }
-    let fields: Vec<u32> = desc.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let fields: Vec<u32> = desc.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
     if fields[0] != 4 {
         return Err(BooterError::UnsupportedBootloaderDescriptor);
     }

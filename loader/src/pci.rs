@@ -209,6 +209,7 @@ impl PciIo {
 
     /// BAR memory write of `count` u32 scalars via `Mem.Write` (the only
     /// host-to-VRAM bulk path: BAR1 into the framebuffer).
+    #[allow(dead_code)] // BAR write path: consumed by the TX transaction only
     fn mem_write_raw(&self, width: PciWidth, bar: u8, offset: u64, count: usize, buf: *mut c_void) -> Status {
         // Safety: exclusive-borrowed protocol; caller owns the source buffer.
         unsafe { (self.0.mem.write)(&self.0 as *const _ as *mut _, width, bar, offset, count, buf) }
@@ -483,6 +484,7 @@ impl PciIo {
 
     /// Bulk u32 write into a BAR window (VRAM fallback staging via BAR1).
     /// `buf.len()` must be a multiple of 4.
+    #[allow(dead_code)] // BAR write path: consumed by the TX transaction only
     pub fn bar_write_buf(&self, bar: u8, offset: u64, buf: &[u8]) -> Status {
         self.mem_write_raw(PciWidth::Uint32, bar, offset, buf.len() / 4, buf.as_ptr() as *mut c_void)
     }

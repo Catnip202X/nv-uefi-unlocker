@@ -224,11 +224,6 @@ fn t22_replay_halt_missing_fails() {
     assert!(err.reason.contains("halted"));
 }
 
-fn run_ga102(faults: Faults) -> Result<crate::transaction::Report, PhaseError> {
-    let mut gpu = FakeGpu::new_locked_cold(None);
-    Transaction::new_ga102_payload(&mut gpu, faults).run()
-}
-
 /// GA102 canonical payload (issue #6 root cause, now the fix's contract):
 /// single PLM write + fill self-loop tail. The verdict is the PLM flip -
 /// NO marker, NO halt (the core keeps running by design); the triad

@@ -73,7 +73,7 @@ pub fn find_expansion_offset(image: &[u8]) -> Result<usize, VbiosError> {
         let code = u8v(image, p + 0x14).unwrap_or(0);
         let mut sub = imglen;
         // NVIDIA PCI Data Extension: SUBIMAGE_LEN overrides the stride.
-        let npde_at = p + slen + 0xf & !0xf;
+        let npde_at = (p + slen + 0xf) & !0xf;
         if image.get(npde_at..npde_at + 4) == Some(b"NPDE".as_slice()) {
             let rev = u16v(image, npde_at + 4).unwrap_or(0);
             if rev == 0x10 || rev == 0x11 {

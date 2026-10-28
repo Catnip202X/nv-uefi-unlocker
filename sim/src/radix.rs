@@ -62,7 +62,7 @@ impl Radix {
     }
 
     fn page_of(&self, addr: u64) -> usize {
-        assert!(addr >= self.dma_base && (addr - self.dma_base) % RADIX_PAGE as u64 == 0);
+        assert!(addr >= self.dma_base && (addr - self.dma_base).is_multiple_of(RADIX_PAGE as u64));
         ((addr - self.dma_base) / RADIX_PAGE as u64) as usize
     }
 
@@ -74,8 +74,7 @@ impl Radix {
         };
         let l0 = get64(0, (page >> 18) as usize);
         let l1 = get64(self.page_of(l0), ((page >> 9) & 511) as usize);
-        let l2 = get64(self.page_of(l1), (page & 511) as usize);
-        l2
+        get64(self.page_of(l1), (page & 511) as usize)
     }
 
     pub fn leaf(&self, page: u64) -> &[u8; RADIX_PAGE] {
