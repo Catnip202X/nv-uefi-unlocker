@@ -470,7 +470,7 @@ pub fn fwsec_ignite(gpu: &TxGpu, layout: &LayoutOut) -> Result<(), TxError> {
         return Err(TxError::ENodev);
     }
     let rom: &[u8] = unsafe { core::slice::from_raw_parts(rom_words.as_ptr() as *const u8, mapped) };
-    info!("FWSEC: PROM bytes={mapped} signature={:#x}", rom[0] as u16 | 0);
+    info!("FWSEC: PROM bytes={mapped} signature={:#06x}", le16(rom, 0));
 
     let fw = match prom_find_fwsec(&rom, false) {
         Some(f) => f,

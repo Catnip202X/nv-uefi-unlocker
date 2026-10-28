@@ -678,7 +678,14 @@ pub fn list_root_entries() {
         if n == 0 {
             break; // end of directory
         }
-        if n < 76 {
+        // EFI_FILE_INFO fixed part = 80 bytes: Size(8) + FileSize(8) +
+        // PhysicalSize(8) + 3x EFI_TIME(48) + Attribute(8); FileName[] is the
+        // CHAR16 array that starts at 80, not at 72 (reading 72 lands on the
+        // Attribute field: 0x20 = archive -> one space, then the name's NUL is
+        // never reached because the byte after Attribute is the first UCS-2
+        // character, so every entry logged a blank name).
+        const INFO_FIXED_LEN: usize = 80;
+        if n < INFO_FIXED_LEN + 2 {
             info!("TX-ROOT-DIR: short entry {n}");
             continue;
         }
@@ -686,8 +693,8 @@ pub fn list_root_entries() {
         let mut name = [0u8; 96];
         let mut m = 0usize;
         let mut chars = 0usize;
-        while chars + 1 < n - 72 && m + 1 < name.len() {
-            let u = u16::from_le_bytes([buf[72 + chars], buf[73 + chars]]);
+        while INFO_FIXED_LEN + chars + 1 < n && m + 1 < name.len() {
+            let u = u16::from_le_bytes([buf[INFO_FIXED_LEN + chars], buf[INFO_FIXED_LEN + chars + 1]]);
             if u == 0 { break; }
             name[m] = if (0x20..0x7f).contains(&u) { u as u8 } else { b'?' };
             m += 1;
