@@ -999,10 +999,13 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
             }
             other => info!("  ext cap {:#06x} @{:#06x}", other, off),
         }
-        if next == 0 || next <= off {
-            if next != 0 {
-                info!("  ext cap walk stopped: next {next:#06x} does not advance");
-            }
+        // Extended capability chains are NOT ordered by offset - a PCIe list
+        // may point backwards (field-measured AD106: 0x100 -> 0x250 -> 0x258 ->
+        // 0x128 -> 0x420 -> 0). A monotonicity check therefore truncates a
+        // valid list, so only the terminator and a malformed below-0x100
+        // pointer end the walk; the iteration cap above is what bounds a
+        // cyclic one.
+        if next == 0 || next < 0x100 {
             break;
         }
         off = next;
