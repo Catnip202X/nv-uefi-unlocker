@@ -370,9 +370,13 @@ TU106 出厂钳制实测：SS0 冷值非默认（0x15000/0x11000/0x0 引导间
 双层校验，长度或 hash 不符即硬失败。
 
 
-**Turing 2070 解锁后 VS 解锁前 ，大家有相同卡的可以自己跑一下对比见真知**
+**Turing 2070 解锁前 VS 解锁后 ，大家有相同卡的可以自己跑一下对比见真知**
 
+
+解锁前
 <img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/6e61c642-7202-47a6-b6a0-cc2d986892d3" />
+
+解锁后
 <img width="800" height="450" alt="image" src="https://github.com/user-attachments/assets/8c103363-8e44-4d46-ab47-a6c063ae1e6f" />
 
 
