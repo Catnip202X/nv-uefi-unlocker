@@ -1406,7 +1406,12 @@ pub fn handoff_out(pci: &crate::pci::PciIo) {
     };
     info!(
         "HANDOFF-OUT: ss0={ss0:#010x} ss1={ss1:#x} readout1={readout:#010x} feat_plm={plm:#010x} wpr2_hi={wpr_hi:#x} pmcsr={pmcsr:#06x} dstate=D{dstate} | tu10x: plm={tplm:#010x} ss0={tss0:#010x} ss1={tss1:#010x} | tu10x_unlock={} ss0_unlock={} ss1_unlock={} plm_open={}",
-        tplm == 0xffff_ffff && tss0 == crate::tx_booter::SS0_UNLOCK && tss1 == crate::tx_booter::SS1_UNLOCK,
+        // Relock-aware (issues #12/#14): the shipped tu10x chain closes the
+        // PLM gate after the SS writes (open -> write -> close), so the
+        // success shape is the SS override persisted behind a closed gate -
+        // plm_open is reported separately, and a still-open PLM (0xffffffff)
+        // is covered here too since the SS reads are the same predicate.
+        tss0 == crate::tx_booter::SS0_UNLOCK && tss1 == crate::tx_booter::SS1_UNLOCK,
         ss0 == crate::tx_booter::SS0_UNLOCK,
         ss1 == crate::tx_booter::SS1_UNLOCK,
         plm == 0xffff_ffff,

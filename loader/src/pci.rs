@@ -429,24 +429,27 @@ impl PciIo {
             }
         }
         // Map forensics for the field report (issue #17: "EFI memory map not
-        // yet captured"): every conventional descriptor ending at/above
-        // 2 GiB, plus the count fully above 4 GiB.
+        // yet captured"): every descriptor ending at/above 2 GiB - ALL
+        // types, not just conventional, because what the firmware did with
+        // the high RAM is the open question behind the per-board 0x91
+        // differences (issues #16/#17/#19).
         let mut above4g = 0u32;
+        let mut lines = 0u32;
         for d in mmap.entries() {
-            if d.ty != MemoryType::CONVENTIONAL {
-                continue;
-            }
             let end = d.phys_start.saturating_add((d.page_count as u64) * 4096);
-            if d.phys_start >= FOUR_GB {
+            if d.ty == MemoryType::CONVENTIONAL && d.phys_start >= FOUR_GB {
                 above4g += 1;
             }
-            if end >= 0x8000_0000 {
+            if end >= 0x8000_0000 && lines < 32 {
                 info!(
-                    "MEMMAP: conventional {:#x}-{:#x} ({} MiB)",
+                    "MEMMAP: {:#x}-{:#x} ({} MiB) type={:?} attr={:?}",
                     d.phys_start,
                     end,
-                    ((d.page_count as u64) * 4096) >> 20
+                    ((d.page_count as u64) * 4096) >> 20,
+                    d.ty,
+                    d.att
                 );
+                lines += 1;
             }
         }
         info!(

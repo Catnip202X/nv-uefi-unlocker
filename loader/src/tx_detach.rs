@@ -112,10 +112,23 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
     // still guarantees the target's own stack comes off.
     let gop_handles =
         boot::locate_handle_buffer(boot::SearchType::ByProtocol(&GraphicsOutput::GUID));
+    // A/B isolation (issue #14 flip): the prefix check misclassified the
+    // target's own GOP on at least one single-GPU board (the board had no
+    // Intel VGA in PCI enumeration, yet the GOP was declared "not on the
+    // target GPU"), so v2.1.0-pre..v2.1.2 left the console connected where
+    // v0.2.0 disconnected it - the only transaction-path delta on the
+    // machine that flipped 0x91 -> unlocked. \tx-gop-disconnect.txt forces
+    // the v0.2.0 behavior (disconnect every GOP handle) so the GOP variable
+    // can be tested one boot per side on otherwise identical code.
+    let force_gop_disconnect =
+        crate::tx::read_boot_file("\\tx-gop-disconnect.txt").is_some();
+    if force_gop_disconnect {
+        info!("DETACH: \\tx-gop-disconnect.txt present - disconnecting every GOP handle (v0.2.0 behavior)");
+    }
     if let Ok(h) = gop_handles {
         for i in 0..h.len() {
             let gop = h[i];
-            if !gop_belongs_to_target(gop, pci_handle) {
+            if !force_gop_disconnect && !gop_belongs_to_target(gop, pci_handle) {
                 info!("DETACH: GOP handle {:?} is not on the target GPU (multi-GPU) - left untouched, its console stays alive", gop);
                 continue;
             }
