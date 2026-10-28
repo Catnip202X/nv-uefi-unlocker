@@ -16,15 +16,29 @@ use uefi::{cstr16, system, CStr16, CString16};
 
 pub const LOG_PATH: &CStr16 = cstr16!(r"\loader.log");
 
+/// Flush every 16th line, and always on stage/verdict lines. FAT only
+/// commits size/dirent on Flush, so the markers below are what survives a
+/// hang or mid-call reset - exactly what the 2026-10-27 Z790 diagnosis
+/// needed (the log ended at "POST-FLR: verified"). A Flush per line is
+/// visible on slow USB media (the TU106 run of 2026-10-28 spent noticeable
+/// seconds on ~415 flushed lines).
+const FLUSH_EVERY_LINES: usize = 16;
+const FLUSH_MARKERS: &[&str] = &[
+    "PHASE", "RESULT", "POST-", "FINAL", "RECONNECT", "DETACH", "CHAIN",
+    "SELECTOR", "HANDOFF", "WATCHDOG", "AUTH-SCAN end",
+];
+
 struct DualLogger {
     file: UnsafeCell<Option<RegularFile>>,
     // set after a failed open so we log the reason exactly once
     file_error_reported: UnsafeCell<bool>,
+    lines: UnsafeCell<usize>,
 }
 
 static LOGGER: DualLogger = DualLogger {
     file: UnsafeCell::new(None),
     file_error_reported: UnsafeCell::new(false),
+    lines: UnsafeCell::new(0),
 };
 
 // Safety: UEFI applications are single-threaded during boot services.
@@ -47,14 +61,18 @@ impl Log for DualLogger {
             record.args()
         );
 
-        // File mirror FIRST, flushed per line: a hang or reset anywhere in
-        // the run must still leave every line up to it on the stick (FAT
-        // only commits size/dirent on Flush/Close). The console comes second
-        // because a dangling console chain is itself a suspected crash site.
+        // File mirror FIRST, then console: a dangling console chain is
+        // itself a suspected crash site, so the stick must already hold the
+        // line before it is mirrored. Flush policy: see FLUSH_MARKERS above.
         // Safety: single-threaded boot services; pointer use is confined here.
         unsafe {
+            let n = *self.lines.get() + 1;
+            *self.lines.get() = n;
+            let flush = n % FLUSH_EVERY_LINES == 0
+                || FLUSH_MARKERS.iter().any(|m| line.contains(m));
             if let Some(f) = (*self.file.get()).as_mut() {
-                if f.write(line.as_bytes()).is_err() || f.flush().is_err() {
+                let ok = f.write(line.as_bytes()).is_ok() && (!flush || f.flush().is_ok());
+                if !ok {
                     // Media pulled: stop trying, keep console alive.
                     *self.file.get() = None;
                 }
