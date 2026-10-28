@@ -356,6 +356,55 @@ fn ensure_driver() -> Result<PmxDrv, String> {
     PmxDrv::try_open().ok_or_else(|| "service started but \\\\.\\PMXDRV never appeared".into())
 }
 
+
+// ---------------------------------------------------------------- BAR0 discovery
+
+/// Discover the NVIDIA display adapters' MMIO ranges from the OS itself.
+/// Physical assignments change every boot (UEFI assigns one layout, Windows
+/// re-assigns another) - a base remembered from any previous session is a
+/// hazard, not a shortcut (2026-10-28: a stale UEFI-era address mapped a
+/// foreign MMIO window and the first read hard-hung the machine).
+fn discover_ranges() -> Result<Vec<(u64, u64)>, String> {
+    let ps = "$r = Get-CimInstance Win32_PnPAllocatedResource | Where-Object { $_.Dependent -match 'VEN_10DE' -and $_.Antecedent -match 'Memory' }
+              $r | ForEach-Object { Get-CimInstance $_.Antecedent } | ForEach-Object { \"{0} {1}\" -f $_.StartingAddress, $_.EndingAddress }";
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps])
+        .output()
+        .map_err(|e| format!("powershell spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("powershell query failed: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    let mut ranges = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let (Some(a), Some(b)) = (it.next(), it.next()) else { continue };
+        let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>()) else { continue };
+        if a != 0 && b >= a {
+            ranges.push((a, b));
+        }
+    }
+    ranges.sort();
+    ranges.dedup();
+    Ok(ranges)
+}
+
+/// Guard rail: the base must be the start of one of the GPU's OWN memory
+/// ranges, and after mapping the first register must look like a real
+/// PMC_BOOT_0 before anything else is read.
+fn validate_base(bar0: u64, ranges: &[(u64, u64)]) -> Result<(), String> {
+    println!("GPU memory ranges (this boot):");
+    for (a, b) in ranges {
+        println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
+    }
+    if !ranges.iter().any(|(a, _)| *a == bar0) {
+        return Err(format!(
+            "REFUSED: {bar0:#x} is not the start of any NVIDIA memory range this boot.
+             Physical assignments change between UEFI and Windows - never reuse an address from an earlier session or a log."
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- register dump
 
 const SS0_UNLOCK: u32 = 0x8888_8888;
@@ -529,11 +578,41 @@ fn run() -> i32 {
             }
         }
     }
-    let Some(bar0) = bar0 else {
-        eprintln!("usage: ssdiag --bar0 <BAR0 physical base, e.g. 0x50000000> [--reapply]");
-        eprintln!("BAR0 base: Device Manager -> GPU -> Resources, or the PowerShell snippet in tools/ssdiag/README.md");
-        return 2;
+    let ranges = match discover_ranges() {
+        Ok(r) if r.is_empty() => {
+            eprintln!("no NVIDIA display adapter memory ranges found (driver running?)");
+            return 2;
+        }
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
+    // auto-pick: exactly one 16 MiB range = BAR0 (straps: 16 MiB << idx)
+    let bar0 = match bar0 {
+        Some(v) => v,
+        None => {
+            let cands: Vec<_> = ranges.iter().copied().filter(|(a, b)| b - a + 1 == 0x100_0000).collect();
+            match cands.as_slice() {
+                [(only, _)] => {
+                    println!("BAR0 auto-detected: {only:#x}");
+                    *only
+                }
+                _ => {
+                    eprintln!("--bar0 required; GPU memory ranges this boot:");
+                    for (a, b) in &ranges {
+                        eprintln!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
+                    }
+                    return 2;
+                }
+            }
+        }
+    };
+    if let Err(e) = validate_base(bar0, &ranges) {
+        eprintln!("{e}");
+        return 2;
+    }
 
     let drv = match ensure_driver() {
         Ok(d) => d,
@@ -557,6 +636,12 @@ fn run() -> i32 {
 
     let boot0 = rd(0x0);
     let fam = family_of(boot0);
+    if fam.is_none() {
+        // validated against the OS ranges, yet not an NVIDIA PMC - stop here
+        drv.unmap_physical(va);
+        eprintln!("PMC_BOOT_0={boot0:#010x} does not look like an NVIDIA BAR0 - aborting before any further reads");
+        return 1;
+    }
     dump_debug(&rd);
 
     let Some((fam_name, regs)) = fam else {
