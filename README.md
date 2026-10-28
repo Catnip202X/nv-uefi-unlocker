@@ -515,6 +515,8 @@ ssdiag --select 2504          # 多卡系统只看 DeviceID 含 2504 的卡
 `tools/ssdiag`（独立 crate，`cargo build --release` 即可重建，详见其
 `README.md`）。
 
+<img width="750" height="780" alt="image" src="https://github.com/user-attachments/assets/d475654e-bc0a-4def-b48a-05ff6095b118" />
+
 ## 构建
 
 ```
