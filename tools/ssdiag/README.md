@@ -7,10 +7,17 @@ AON behavior), re-applies the SS override values **without a reboot**
 
 ## What it dumps
 
+- multi-GPU: every NVIDIA Display-class function is dumped (companion
+  audio/USB-C functions excluded), `--select` narrows.
 - core/debug block: PMC_BOOT_0, PSTRAPS (decoded BAR1/BAR0/BAR3 sizes),
-  FB_SIZE_MIB, GFW PLM/scratch, BSI_SCRATCH15, WPR2 lo/hi, MMU lock window,
-  GSP/SEC2 CPUCTL + mailboxes + EXCI, fuse override bits — with `badf`
-  bucketing (PRIV_VIOLATION / UNDECODED / FLOORSWEPT).
+  FB_SIZE_MIB, GFW PLM/scratch, BSI_SCRATCH15, VGA_WORKSPACE, WPR2 lo/hi,
+  MMU PLM + lock window, GSP/SEC2 CPUCTL + mailboxes + EXCI, fuse
+  rows — with `badf` bucketing (PRIV_VIOLATION / UNDECODED / FLOORSWEPT).
+- FEAT clusters of BOTH families on every chip: Turing gains READOUT
+  (0x409668, per nlzy); plus the Ada four-write targets, the AD10x
+  64G-BAR1 line (CYA/CFG/XVE/BAR1 cap mirror), the cmp170hx 26-register
+  PLM survey, and the Ampere/Ada FEAT sweep — the union of the register
+  surfaces the reference unlockers touch.
 - FEAT cluster of BOTH families (Turing 0x4096xx + Ampere/Ada 0x823xxx) on
   every chip, so nothing depends on getting the family route right.
 - Verdict: SS override values live = unlocked; gate open + stock values =
@@ -37,18 +44,14 @@ already-running driver works unelevated only if the device ACL allows it.
 ## Usage
 
 ```text
-ssdiag --bar0 0x50000000            # debug dump + FEAT verdict
-ssdiag --bar0 0x50000000 --reapply  # SS0=0x88888888 SS1=0x8 while the gate is open
+ssdiag                              # dump every NVIDIA display GPU (auto-discovers BAR0 per card)
+ssdiag --reapply                    # + SS0=0x88888888 SS1=0x8 per card where the gate is open
+ssdiag --select 1F07                # narrow to functions whose DeviceID matches
 ```
 
-Find BAR0 physical base:
-
-```powershell
-$gpu = Get-PnpDevice -Class Display | Where-Object InstanceId -match 'VEN_10DE'
-Get-CimInstance Win32_PnPAllocatedResource |
-  Where-Object { $_.Dependent -eq $gpu.DeviceID -and $_.Antecedent -match 'Memory' }
-# follow the Antecedent -> Win32_DeviceMemory -> StartingAddress
-```
+`--bar0` was removed in v0.3: physical assignments change between UEFI and
+Windows (a stale base once hard-hung a machine), so the tool discovers each
+GPU's ranges from the OS itself and refuses anything it did not discover.
 
 ## Build
 

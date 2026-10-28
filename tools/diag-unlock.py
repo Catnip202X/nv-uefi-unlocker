@@ -32,13 +32,42 @@ SS0_UNLOCK = 0x8888_8888
 SS1_UNLOCK = 0x8
 
 # offset -> name, per family
-TURING = {"plm": 0x0040_9650, "ss0": 0x0040_9664, "ss1": 0x0040_966C}
+TURING = {"plm": 0x0040_9650, "ss0": 0x0040_9664, "readout": 0x0040_9668, "ss1": 0x0040_966C}
 GAADA = {
     "plm": 0x0082_3804,
     "ss0": 0x0082_381C,
     "ss1": 0x0082_3820,
     "readout": 0x0082_3818,
 }
+# union with the reference unlockers (loader M1 + cmp170hx survey + chenxluo)
+CORE_EXTRA = [
+    ("VGA_WORKSPACE", 0x0062_5F04),
+    ("MMU_PLM", 0x001F_A7C8),
+    ("FUSE_VER_DECODE", 0x0082_41C0),
+]
+ADA_ROWS = [
+    ("WPR_PLM", 0x001F_A7C4),
+    ("WPR_CFG_PLM", 0x001F_A7CC),
+    ("FBPA_PLM", 0x009A_0148),
+]
+AD1X_ROWS = [
+    ("AD1X_CYA", 0x0008_8724),
+    ("AD1X_CFG", 0x0008_8DCC),
+    ("AD1X_XVE_PLM", 0x0008_8FF4),
+    ("AD1X_BAR1_CAP_MIRROR", 0x0008_8BBC),
+]
+PLM_SURVEY = [
+    0x0082_00D0, 0x0082_00D4, 0x0082_00D8, 0x0082_00DC, 0x0082_00E0, 0x0082_00E4,
+    0x0082_00E8, 0x0082_00EC, 0x0082_00F0, 0x0082_00F4, 0x0082_00FC,
+    0x0082_3800, 0x0082_3804, 0x0082_3B00,
+    0x009A_0008, 0x009A_000C, 0x009A_0148, 0x009A_014C, 0x009A_0168, 0x009A_03F0,
+    0x009A_0554, 0x009A_0BFC,
+    0x0010_0B10, 0x0010_0B38, 0x0010_0B84, 0x0010_0B9C,
+]
+AMPADA_SWEEP = [
+    0x0082_3800, 0x0082_3808, 0x0082_380C, 0x0082_3810, 0x0082_3814, 0x0082_3824,
+    0x0082_3828, 0x0082_382C, 0x0082_3B00,
+]
 
 
 def find_gpus():
@@ -128,6 +157,20 @@ def report(bar, tag=""):
         ro = bar.rd(regs["readout"])
         note = "PLM-blocked" if (ro & 0xFFFF0000) == 0xBADF0000 else ("full speed" if ro == 0 else "")
         print(f"  READOUT_1 = {ro:#010x} {note}")
+    for name, off in CORE_EXTRA:
+        print(f"  {name:<22} = {bar.rd(off):#010x}")
+    print("  --- family-specific / survey (badf on the wrong die is expected) ---")
+    for name, off in ADA_ROWS + AD1X_ROWS:
+        v = bar.rd(off)
+        note = f" ({decode_plm(v)})" if name.endswith("PLM") else ""
+        print(f"  {name:<22} = {v:#010x}{note}")
+    for i in range(0, len(PLM_SURVEY), 4):
+        row = PLM_SURVEY[i:i+4]
+        print("  " + "  ".join(f"{o:#09x}={bar.rd(o):#010x}" for o in row))
+    print("  --- ampere/ada FEAT sweep ---")
+    for i in range(0, len(AMPADA_SWEEP), 5):
+        row = AMPADA_SWEEP[i:i+5]
+        print("  " + "  ".join(f"{o:#09x}={bar.rd(o):#010x}" for o in row))
     unlocked = ss0 == SS0_UNLOCK and ss1 == SS1_UNLOCK
     print(f"  VERDICT: {'UNLOCKED (override values live)' if unlocked else 'not unlocked'}"
           f"{' - reapply available (door open)' if not unlocked and plm == 0xFFFF_FFFF else ''}")

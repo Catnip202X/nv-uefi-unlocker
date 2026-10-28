@@ -359,50 +359,70 @@ fn ensure_driver() -> Result<PmxDrv, String> {
 
 // ---------------------------------------------------------------- BAR0 discovery
 
-/// Discover the NVIDIA display adapters' MMIO ranges from the OS itself.
+/// One NVIDIA PCI function and its MMIO ranges this boot.
+struct Gpu {
+    /// Win32_PnPEntity DeviceID (identifies the function; safe for --select).
+    id: String,
+    /// sorted (start, end) memory ranges
+    ranges: Vec<(u64, u64)>,
+}
+
+impl Gpu {
+    /// BAR0 candidate: the smallest range >= 16 MiB (BAR0 is 16 MiB << idx
+    /// per straps; the audio/USB-C companion functions never get that big).
+    fn bar0_candidate(&self) -> Option<u64> {
+        self.ranges
+            .iter()
+            .filter(|(a, b)| b - a + 1 >= 0x100_0000)
+            .map(|(a, _)| *a)
+            .min()
+    }
+}
+
+/// Discover the NVIDIA PCI functions' MMIO ranges from the OS itself.
 /// Physical assignments change every boot (UEFI assigns one layout, Windows
 /// re-assigns another) - a base remembered from any previous session is a
 /// hazard, not a shortcut (2026-10-28: a stale UEFI-era address mapped a
 /// foreign MMIO window and the first read hard-hung the machine).
-fn discover_ranges() -> Result<Vec<(u64, u64)>, String> {
-    let ps = "$r = Get-CimInstance Win32_PnPAllocatedResource | Where-Object { $_.Dependent -match 'VEN_10DE' -and $_.Antecedent -match 'Memory' }
-              $r | ForEach-Object { Get-CimInstance $_.Antecedent } | ForEach-Object { \"{0} {1}\" -f $_.StartingAddress, $_.EndingAddress }";
+fn discover_gpus() -> Result<Vec<Gpu>, String> {
+    // Dependent/Antecedent are embedded CimInstance objects - property access,
+    // not string regex (the Dependent.ToString path does not round-trip).
+    // Display-class filter keeps companion functions (audio/USB-C) out.
+    let ps = "$disp = Get-PnpDevice -Class Display | Where-Object InstanceId -match 'VEN_10DE' | Select-Object -ExpandProperty InstanceId
+              $r = Get-CimInstance Win32_PnPAllocatedResource | Where-Object { $_.Dependent -match 'VEN_10DE' -and $_.Antecedent -match 'Memory' }
+              $r | ForEach-Object { $id = $_.Dependent.DeviceID; if ($disp -ccontains $id) { $m = Get-CimInstance $_.Antecedent; \"{0}|{1}|{2}\" -f $id, $m.StartingAddress, $m.EndingAddress } }";
     let out = std::process::Command::new("powershell")
         .args(["-NoProfile", "-Command", ps])
         .output()
         .map_err(|e| format!("powershell spawn failed: {e}"))?;
     if !out.status.success() {
-        return Err(format!("powershell query failed: {}", String::from_utf8_lossy(&out.stderr)));
-    }
-    let mut ranges = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut it = line.split_whitespace();
-        let (Some(a), Some(b)) = (it.next(), it.next()) else { continue };
-        let (Ok(a), Ok(b)) = (a.parse::<u64>(), b.parse::<u64>()) else { continue };
-        if a != 0 && b >= a {
-            ranges.push((a, b));
-        }
-    }
-    ranges.sort();
-    ranges.dedup();
-    Ok(ranges)
-}
-
-/// Guard rail: the base must be the start of one of the GPU's OWN memory
-/// ranges, and after mapping the first register must look like a real
-/// PMC_BOOT_0 before anything else is read.
-fn validate_base(bar0: u64, ranges: &[(u64, u64)]) -> Result<(), String> {
-    println!("GPU memory ranges (this boot):");
-    for (a, b) in ranges {
-        println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
-    }
-    if !ranges.iter().any(|(a, _)| *a == bar0) {
         return Err(format!(
-            "REFUSED: {bar0:#x} is not the start of any NVIDIA memory range this boot.
-             Physical assignments change between UEFI and Windows - never reuse an address from an earlier session or a log."
+            "powershell query failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         ));
     }
-    Ok(())
+    let mut gpus: Vec<Gpu> = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.trim().split('|');
+        let (Some(id), Some(a), Some(b)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(a), Ok(b)) = (a.trim().parse::<u64>(), b.trim().parse::<u64>()) else {
+            continue;
+        };
+        if id.is_empty() || a == 0 || b < a {
+            continue;
+        }
+        match gpus.iter_mut().find(|g| g.id == id) {
+            Some(g) => g.ranges.push((a, b)),
+            None => gpus.push(Gpu { id: id.to_string(), ranges: vec![(a, b)] }),
+        }
+    }
+    for g in &mut gpus {
+        g.ranges.sort();
+    }
+    gpus.retain(|g| !g.ranges.is_empty());
+    Ok(gpus)
 }
 
 // ---------------------------------------------------------------- register dump
@@ -410,8 +430,13 @@ fn validate_base(bar0: u64, ranges: &[(u64, u64)]) -> Result<(), String> {
 const SS0_UNLOCK: u32 = 0x8888_8888;
 const SS1_UNLOCK: u32 = 0x8;
 
-const FEAT_TURING: [(&str, u32); 3] =
-    [("PLM", 0x0040_9650), ("SS0", 0x0040_9664), ("SS1", 0x0040_966C)];
+// READOUT at 0x409668 per nlzy turing-unlock (TU_FEAT_READOUT).
+const FEAT_TURING: [(&str, u32); 4] = [
+    ("PLM", 0x0040_9650),
+    ("SS0", 0x0040_9664),
+    ("READOUT", 0x0040_9668),
+    ("SS1", 0x0040_966C),
+];
 const FEAT_AMPADA: [(&str, u32); 4] = [
     ("PLM", 0x0082_3804),
     ("SS0", 0x0082_381C),
@@ -419,8 +444,9 @@ const FEAT_AMPADA: [(&str, u32); 4] = [
     ("READOUT_1", 0x0082_3818),
 ];
 /// Readable-at-PL0 core/debug block. Data-driven on purpose: add rows here
-/// as the debug surface grows.
-const CORE_ROWS: [(&str, u32); 17] = [
+/// as the debug surface grows. VGA/MMU_PLM/FUSE_VER_DECODE from the loader
+/// M1 sample table; the rest cross-checked against the reference unlockers.
+const CORE_ROWS: [(&str, u32); 20] = [
     ("PMC_BOOT_0", 0x0000_0000),
     ("PSTRAPS_SET0", 0x0010_1000),
     ("PSTRAPS_SET1", 0x0010_100C),
@@ -428,8 +454,10 @@ const CORE_ROWS: [(&str, u32); 17] = [
     ("GFW_PLM", 0x0011_8128),
     ("GFW_SCRATCH", 0x0011_8234),
     ("BSI_SCRATCH15", 0x0011_80FC),
+    ("VGA_WORKSPACE", 0x0062_5F04),
     ("WPR2_LO", 0x001F_A824),
     ("WPR2_HI", 0x001F_A828),
+    ("MMU_PLM", 0x001F_A7C8),
     ("MMU_LOCK_LO", 0x001F_A82C),
     ("MMU_LOCK_HI", 0x001F_A830),
     ("GSP_CPUCTL", 0x0011_0100),
@@ -438,10 +466,39 @@ const CORE_ROWS: [(&str, u32); 17] = [
     ("SEC2_MBOX0", 0x0084_0040),
     ("SEC2_MBOX1", 0x0084_0044),
     ("SEC2_EXCI", 0x0084_00D0),
+    ("FUSE_VER_DECODE", 0x0082_41C0),
 ];
 /// Privileged block - usually badf at PL0, still worth the record.
 const PRIV_ROWS: [(&str, u32); 2] =
     [("FUSE_OPT_FEATURE_OVR", 0x0082_03F0), ("FUSE_VER", 0x0082_4140)];
+/// Ada four-write chain targets (WPR_CFG -> FBPA -> WPR -> FEAT).
+const ADA_ROWS: [(&str, u32); 3] = [
+    ("WPR_PLM", 0x001F_A7C4),
+    ("WPR_CFG_PLM", 0x001F_A7CC),
+    ("FBPA_PLM", 0x009A_0148),
+];
+/// AD10x 64G-BAR1 line (CYA/CFG must go through SEC2; host writes dropped).
+const AD1X_ROWS: [(&str, u32); 4] = [
+    ("AD1X_CYA", 0x0008_8724),
+    ("AD1X_CFG", 0x0008_8DCC),
+    ("AD1X_XVE_PLM", 0x0008_8FF4),
+    ("AD1X_BAR1_CAP_MIRROR", 0x0008_8BBC),
+];
+/// cmp170hx 26-register PLM survey (union across references; GA100-era
+/// addresses - on other dies expect badf or benign values, that IS data).
+const PLM_SURVEY: [u32; 26] = [
+    0x0082_00D0, 0x0082_00D4, 0x0082_00D8, 0x0082_00DC, 0x0082_00E0, 0x0082_00E4,
+    0x0082_00E8, 0x0082_00EC, 0x0082_00F0, 0x0082_00F4, 0x0082_00FC,
+    0x0082_3800, 0x0082_3804, 0x0082_3B00,
+    0x009A_0008, 0x009A_000C, 0x009A_0148, 0x009A_014C, 0x009A_0168, 0x009A_03F0,
+    0x009A_0554, 0x009A_0BFC,
+    0x0010_0B10, 0x0010_0B38, 0x0010_0B84, 0x0010_0B9C,
+];
+/// Ampere/Ada FEAT sweep (loader M1 cluster) minus rows FEAT_AMPADA has.
+const AMPADA_SWEEP: [u32; 9] = [
+    0x0082_3800, 0x0082_3808, 0x0082_380C, 0x0082_3810, 0x0082_3814, 0x0082_3824,
+    0x0082_3828, 0x0082_382C, 0x0082_3B00,
+];
 
 fn badf_bucket(v: u32) -> Option<&'static str> {
     if v >> 16 != 0xBADF {
@@ -485,7 +542,8 @@ fn decode_ss(v: u32, width: u32) -> String {
             } else if nib & 0x8 != 0 {
                 // rates 4-7 exist in the field but have no documented meaning
                 let rate = match nib & 7 {
-                    r @ 0..=3 => names[r as usize],
+                    0 => "0".to_string(), // override + full rate
+                    r @ 1..=3 => names[r as usize].to_string(),
                     r => return format!("?{r:x}*"),
                 };
                 format!("{rate}*")
@@ -533,7 +591,7 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
                 "PLM" => format!(" ({})", decode_plm(v)),
                 "SS0" => format!(" [{}]", decode_ss(v, 8)),
                 "SS1" => format!(" [{}]", decode_ss(v, 1)),
-                "READOUT_1" => match badf_bucket(v) {
+                "READOUT" | "READOUT_1" => match badf_bucket(v) {
                     Some(b) => format!(" [{b}]"),
                     None if v == 0 => " [full speed]".into(),
                     None => String::new(),
@@ -542,6 +600,50 @@ fn dump_debug(rd: &dyn Fn(u32) -> u32) {
             };
             println!("  {label:<20} {name:<9} = {v:#010x}{note}");
         }
+    }
+    println!("--- family-specific lines (safe reads; badf on the wrong die is expected) ---");
+    for (label, regs) in [
+        ("ada 4-write", &ADA_ROWS[..]),
+        ("ad1x 64g-bar1", &AD1X_ROWS[..]),
+    ] {
+        for (name, off) in regs {
+            let v = rd(*off);
+            let note = match *name {
+                n if n.ends_with("PLM") => format!(" ({})", decode_plm(v)),
+                _ => match badf_bucket(v) {
+                    Some(b) => format!(" [{b}]"),
+                    None => String::new(),
+                },
+            };
+            println!("  {label:<15} {name:<22} = {v:#010x}{note}");
+        }
+    }
+    println!("--- ampere/ada FEAT sweep (M1 cluster) ---");
+    print!("{: >24}", "");
+    for off in AMPADA_SWEEP {
+        print!(" {off:09x}",);
+    }
+    println!();
+    print!("{: >24}", "value");
+    for off in AMPADA_SWEEP {
+        print!(" {v:09x}", v = rd(off));
+    }
+    println!();
+    println!("--- PLM survey (cmp170hx 26-register union) ---");
+    for (i, off) in PLM_SURVEY.iter().enumerate() {
+        let v = rd(*off);
+        let note = match badf_bucket(v) {
+            Some(b) => format!(" [{b}]"),
+            None if v == 0xFFFF_FFFF => " [OPEN]".to_string(),
+            None => String::new(),
+        };
+        print!("  {off:#09x}={v:#010x}{note}");
+        if i % 2 == 1 {
+            println!();
+        }
+    }
+    if PLM_SURVEY.len() % 2 == 1 {
+        println!();
     }
     for (name, off) in PRIV_ROWS {
         let v = rd(off);
@@ -560,62 +662,51 @@ fn main() {
 }
 
 fn run() -> i32 {
-    let mut bar0: Option<u64> = None;
     let mut reapply = false;
+    let mut select: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--bar0" => {
-                let v = args.next().unwrap_or_else(|| {
-                    eprintln!("--bar0 needs a value (e.g. 0x50000000)");
-                    std::process::exit(2);
-                });
-                let s = v.trim_start_matches("0x").trim_start_matches("0X");
-                bar0 = Some(u64::from_str_radix(s, 16).unwrap_or_else(|_| {
-                    eprintln!("bad --bar0 value {v:?}");
+            "--reapply" => reapply = true,
+            "--select" => {
+                select = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("--select needs a DeviceID substring (e.g. 1F07 or 4&38d5f52c)");
                     std::process::exit(2);
                 }));
             }
-            "--reapply" => reapply = true,
+            "--bar0" => {
+                eprintln!("--bar0 was removed in v0.3: physical assignments change every boot, so                            the tool discovers each GPU's ranges from the OS itself. Use --select                            to narrow multi-GPU systems.");
+                std::process::exit(2);
+            }
             other => {
-                eprintln!("unknown arg {other:?}; usage: ssdiag --bar0 0x50000000 [--reapply]");
+                eprintln!("unknown arg {other:?}; usage: ssdiag [--reapply] [--select <substr>]");
                 return 2;
             }
         }
     }
-    let ranges = match discover_ranges() {
-        Ok(r) if r.is_empty() => {
-            eprintln!("no NVIDIA display adapter memory ranges found (driver running?)");
+
+    let mut gpus = match discover_gpus() {
+        Ok(g) if !g.is_empty() => g,
+        Ok(_) => {
+            eprintln!("no NVIDIA display adapter memory ranges found");
             return 2;
         }
-        Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
             return 2;
         }
     };
-    // auto-pick: exactly one 16 MiB range = BAR0 (straps: 16 MiB << idx)
-    let bar0 = match bar0 {
-        Some(v) => v,
-        None => {
-            let cands: Vec<_> = ranges.iter().copied().filter(|(a, b)| b - a + 1 == 0x100_0000).collect();
-            match cands.as_slice() {
-                [(only, _)] => {
-                    println!("BAR0 auto-detected: {only:#x}");
-                    *only
-                }
-                _ => {
-                    eprintln!("--bar0 required; GPU memory ranges this boot:");
-                    for (a, b) in &ranges {
-                        eprintln!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
-                    }
-                    return 2;
-                }
-            }
+    if let Some(sel) = &select {
+        gpus.retain(|g| g.id.to_uppercase().contains(&sel.to_uppercase()));
+        if gpus.is_empty() {
+            eprintln!("--select {sel:?}: no NVIDIA function matches");
+            return 2;
         }
-    };
-    if let Err(e) = validate_base(bar0, &ranges) {
-        eprintln!("{e}");
+    }
+    // only functions with a BAR0-class window (companion audio/USB-C are small)
+    gpus.retain(|g| g.bar0_candidate().is_some());
+    if gpus.is_empty() {
+        eprintln!("no NVIDIA function with a BAR0-class (>=16 MiB) window found");
         return 2;
     }
 
@@ -627,60 +718,74 @@ fn run() -> i32 {
         }
     };
 
-    const PAGES: u32 = 4096; // 16 MiB BAR0
-    let va = match drv.map_physical(bar0, PAGES) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("map BAR0@{bar0:#x} failed: {e}");
-            return 1;
-        }
-    };
-    let base = va as *const u8;
-    let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
-    let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
-
-    let boot0 = rd(0x0);
-    let fam = family_of(boot0);
-    if fam.is_none() {
-        // validated against the OS ranges, yet not an NVIDIA PMC - stop here
-        drv.unmap_physical(va);
-        eprintln!("PMC_BOOT_0={boot0:#010x} does not look like an NVIDIA BAR0 - aborting before any further reads");
-        return 1;
-    }
-    dump_debug(&rd);
-
-    let Some((fam_name, regs)) = fam else {
-        eprintln!("PMC_BOOT_0={boot0:#010x} - unsupported chip");
-        return 1;
-    };
-    let get = |name: &str| regs.iter().find(|(n, _)| *n == name).unwrap().1;
-    let plm = rd(get("PLM"));
-    let ss0 = rd(get("SS0"));
-    let ss1 = rd(get("SS1"));
-    let unlocked = ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK;
-    println!(
-        "VERDICT [{fam_name}]: {}",
-        if unlocked { "UNLOCKED (override values live)" } else { "not unlocked" }
-    );
-
+    println!("{ } NVIDIA GPU function(s) discovered", gpus.len());
     let mut rc = 0;
-    if reapply {
-        if plm != 0xFFFF_FFFF {
-            println!("reapply REFUSED: FEAT PLM gate is closed - re-run the USB unlock instead");
-            rc = 1;
-        } else {
-            wr(get("SS0"), SS0_UNLOCK);
-            wr(get("SS1"), SS1_UNLOCK);
-            let rb0 = rd(get("SS0"));
-            let rb1 = rd(get("SS1"));
-            let ok = rb0 == SS0_UNLOCK && rb1 == SS1_UNLOCK;
-            println!(
-                "reapply: SS0={rb0:#010x} SS1={rb1:#010x} -> {}",
-                if ok { "OK" } else { "READBACK MISMATCH" }
-            );
-            rc = if ok { 0 } else { 1 };
+    for (i, g) in gpus.iter().enumerate() {
+        if i > 0 {
+            println!();
         }
+        println!("===== GPU {}/{}: {} =====", i + 1, gpus.len(), g.id);
+        println!("ranges:");
+        for (a, b) in &g.ranges {
+            println!("  {a:#x}-{b:#x} ({} MiB)", (b - a + 1) >> 20);
+        }
+        let Some(bar0) = g.bar0_candidate() else { continue };
+        println!("BAR0: {bar0:#x}");
+
+        const PAGES: u32 = 4096; // 16 MiB BAR0
+        let va = match drv.map_physical(bar0, PAGES) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("map BAR0@{bar0:#x} failed: {e}");
+                rc = 1;
+                continue;
+            }
+        };
+        let base = va as *const u8;
+        let rd = |off: u32| unsafe { (base.add(off as usize) as *const u32).read_volatile() };
+        let wr = |off: u32, v: u32| unsafe { (base.add(off as usize) as *mut u32).write_volatile(v) };
+
+        let boot0 = rd(0x0);
+        let Some((fam_name, regs)) = family_of(boot0) else {
+            // validated against the OS ranges, yet not an NVIDIA PMC - stop
+            // reading this card immediately
+            drv.unmap_physical(va);
+            eprintln!("PMC_BOOT_0={boot0:#010x} does not look like an NVIDIA BAR0 - skipping card");
+            rc = 1;
+            continue;
+        };
+        dump_debug(&rd);
+
+        let get = |name: &str| regs.iter().find(|(n, _)| *n == name).unwrap().1;
+        let plm = rd(get("PLM"));
+        let ss0 = rd(get("SS0"));
+        let ss1 = rd(get("SS1"));
+        let unlocked = ss0 == SS0_UNLOCK && ss1 == SS1_UNLOCK;
+        println!(
+            "VERDICT [{fam_name}]: {}",
+            if unlocked { "UNLOCKED (override values live)" } else { "not unlocked" }
+        );
+
+        if reapply {
+            if plm != 0xFFFF_FFFF {
+                println!("reapply REFUSED: FEAT PLM gate is closed - re-run the USB unlock instead");
+                rc = 1;
+            } else {
+                wr(get("SS0"), SS0_UNLOCK);
+                wr(get("SS1"), SS1_UNLOCK);
+                let rb0 = rd(get("SS0"));
+                let rb1 = rd(get("SS1"));
+                let ok = rb0 == SS0_UNLOCK && rb1 == SS1_UNLOCK;
+                println!(
+                    "reapply: SS0={rb0:#010x} SS1={rb1:#010x} -> {}",
+                    if ok { "OK" } else { "READBACK MISMATCH" }
+                );
+                if !ok {
+                    rc = 1;
+                }
+            }
+        }
+        drv.unmap_physical(va);
     }
-    drv.unmap_physical(va);
     rc
 }
