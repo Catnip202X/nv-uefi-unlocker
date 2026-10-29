@@ -187,14 +187,32 @@ fn tx_one_card(g: &pci::FoundGpu) {
     };
     info!("TX: device 10de:{dev:04x} -> asset family '{family}'");
 
-    let booter = tx::read_boot_file_fmt("\\booter_load_{}.bin", family);
-    let boot_desc = tx::read_boot_file_fmt("\\gsp_boot_desc_{}.bin", family);
-    let gsp_boot = tx::read_boot_file_fmt("\\gsp_boot_{}.bin", family);
-    let gsp_image = tx::read_boot_file_fmt("\\fwimage_{}.bin", family);
-    let stock_sig = tx::read_boot_file_fmt("\\fwsignature_{}.bin", family);
-    let v67 = tx::read_boot_file_fmt("\\v67-{}-four-plm.bin", family);
+    // Assets: `Ok(None)` = the stick does not carry it (skip this card);
+    // `Err` = present but unusable (empty / over the size cap / short read /
+    // media pulled) - that must abort BEFORE anything is detached, never
+    // degrade the run to the other write mode.
+    macro_rules! must_asset {
+        ($what:literal, $e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(()) => {
+                    info!(concat!(
+                        "TX: ", $what, " is present but unreadable (damaged stick or pulled media)",
+                        " - aborting before any GPU interaction"
+                    ));
+                    return;
+                }
+            }
+        };
+    }
+    let booter = must_asset!("booter_load", tx::read_asset_fmt("\\booter_load_{}.bin", family));
+    let boot_desc = must_asset!("gsp_boot_desc", tx::read_asset_fmt("\\gsp_boot_desc_{}.bin", family));
+    let gsp_boot = must_asset!("gsp_boot", tx::read_asset_fmt("\\gsp_boot_{}.bin", family));
+    let gsp_image = must_asset!("fwimage", tx::read_asset_fmt("\\fwimage_{}.bin", family));
+    let stock_sig = must_asset!("fwsignature", tx::read_asset_fmt("\\fwsignature_{}.bin", family));
+    let v67 = must_asset!("v67 payload", tx::read_asset_fmt("\\v67-{}-four-plm.bin", family));
     let bl = if family == "tu10x" {
-        tx::read_boot_file("\\sec2_bl_tu10x.bin")
+        must_asset!("sec2_bl", tx::read_asset("\\sec2_bl_tu10x.bin"))
     } else {
         None
     };

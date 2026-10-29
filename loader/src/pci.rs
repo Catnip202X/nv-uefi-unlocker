@@ -371,7 +371,7 @@ impl PciIo {
         // \tx-low-staging.txt forces the legacy PciIo path for A/B testing.
         if !TX_HIGH_STAGING.load(core::sync::atomic::Ordering::Relaxed) {
             info!("DMA alloc: family not gated for >4GB staging - legacy PciIo path");
-        } else if crate::tx::read_boot_file("\\tx-low-staging.txt").is_some() {
+        } else if crate::tx::probe_file("\\tx-low-staging.txt") {
             info!("DMA alloc: \\tx-low-staging.txt present - legacy sub-4GB PciIo path forced");
         } else if let Ok(b) = self.dma_alloc_high(len) {
             return Ok(b);
@@ -948,7 +948,7 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
                         "  PCIe cap @{:#04x}: DEVCAP {:#010x} (FLR {}) LINKCAP {:#010x}",
                         cap_ptr,
                         devcap,
-                        if devcap & (1 << 15) != 0 { "yes" } else { "no" },
+                        if devcap & (1 << 28) != 0 { "yes" } else { "no" },
                         link_cap
                     );
                 }
@@ -964,8 +964,10 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
     let mut off: u32 = 0x100;
     let mut ext_guard = 0u32;
     loop {
-        // Extended capabilities live at 0x100+ and only ever move forward;
-        // a `next` that does not advance is a loop, not a list.
+        // Extended capabilities live at 0x100+, but the list is NOT ordered by
+        // offset: a field-measured AD106 chain goes 0x100 -> 0x250 -> 0x258 ->
+        // 0x128 -> ... (backwards at 0x258 -> 0x128). Only the terminator, a
+        // pointer below 0x100, and the iteration cap below bound this walk.
         ext_guard += 1;
         if ext_guard > 256 {
             info!("  ext cap walk stopped after 256 entries (malformed list)");

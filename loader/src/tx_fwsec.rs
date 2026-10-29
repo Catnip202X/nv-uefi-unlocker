@@ -810,9 +810,17 @@ pub fn scrubber_if_needed(gpu: &TxGpu) -> Result<(), TxError> {
         return Ok(());
     }
 
-    let bundle = crate::tx::read_boot_file("\\scrubber_ad10x.bin")
-        .ok_or(TxError::ENodev)
-        .inspect_err(|_| info!("SCRUB: \\scrubber_ad10x.bin missing on boot volume"))?;
+    let bundle = match crate::tx::read_asset("\\scrubber_ad10x.bin") {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            info!("SCRUB: \\scrubber_ad10x.bin missing on boot volume");
+            return Err(TxError::ENodev);
+        }
+        Err(()) => {
+            info!("SCRUB: \\scrubber_ad10x.bin is present but unreadable - refusing to fire a partial image");
+            return Err(TxError::ENodev);
+        }
+    };
     let (hdr, image, sigs) = crate::tx_booter::load_booter(&bundle, "scrub")?;
     info!(
         "SCRUB: bundle ok - code {:#x}+{:#x}@va{:#x} data {:#x}+{:#x} patch {:#x} ucode {:#x}",

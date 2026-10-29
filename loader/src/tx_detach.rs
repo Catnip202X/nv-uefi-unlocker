@@ -188,7 +188,7 @@ pub fn pm_preflight(pci: &PciIo) -> Result<PmEntry, &'static str> {
     info!("PM: entry PMCSR={before:#06x} state=D{} (cap@{cap:#04x})", before & 0x3);
     if warm {
         info!("PM: WARM ENTRY (resume/fast-startup handoff, not a POST): the previous session's device context is still in this function; the unlock may not survive the Windows handoff");
-        if crate::tx::read_boot_file("\\tx-require-d0.txt").is_some() {
+        if crate::tx::probe_file("\\tx-require-d0.txt") {
             info!("PM: \\tx-require-d0.txt present - aborting before any GPU write (use Restart, or cold boot, and re-run)");
             return Err("warm entry with require-D0 switch set");
         }
@@ -228,7 +228,7 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
     // the v0.2.0 behavior (disconnect every GOP handle) so the GOP variable
     // can be tested one boot per side on otherwise identical code.
     let force_gop_disconnect =
-        crate::tx::read_boot_file("\\tx-gop-disconnect.txt").is_some();
+        crate::tx::probe_file("\\tx-gop-disconnect.txt");
     if force_gop_disconnect {
         info!("DETACH: \\tx-gop-disconnect.txt present - disconnecting every GOP handle (v0.2.0 behavior)");
     }
@@ -324,7 +324,7 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
 /// self-establishes its own console when it starts; this only restores the
 /// display earlier for machines where the dGPU is the primary adapter.
 pub fn reconnect_all(pci_handle: uefi::Handle) {
-    if crate::tx::read_boot_file("\\no-reconnect.txt").is_some() {
+    if crate::tx::probe_file("\\no-reconnect.txt") {
         info!("RECONNECT: skipped (\\no-reconnect.txt) - bootmgfw self-establishes its console");
         return;
     }

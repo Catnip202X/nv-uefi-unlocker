@@ -714,7 +714,7 @@ fn pre_flr_experiment(handle: uefi::Handle) -> bool {
     // and our measured post-FLR state (GFW_BOOT stuck 0x101, both chips)
     // is an environment the kernel never sees. Default OFF so the next
     // round tests the kernel-matching sequence.
-    if read_boot_file("\\pre-flr-on.txt").is_none() {
+    if !probe_file("\\pre-flr-on.txt") {
         info!("PRE-FLR: disabled (no \\pre-flr-on.txt) - kernel-matching flow");
         return false;
     }
@@ -758,18 +758,70 @@ fn pre_flr_experiment(handle: uefi::Handle) -> bool {
     true
 }
 
+/// Does this path exist as a readable regular file? No size gate and no content:
+/// the UI switches are zero-byte marker files by design (`\tx-require-d0.txt`
+/// is documented as "drop an empty file"), so anything that treats "size 0" as
+/// "absent" silently disables them. Kept separate from the asset reader, whose
+/// size rules are about DMA windows, not about intent.
+pub fn probe_file(path: &str) -> bool {
+    let Ok(path_c) = uefi::CString16::try_from(path) else {
+        return false;
+    };
+    use uefi::proto::media::file::{File, FileMode};
+    let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else {
+        return false;
+    };
+    let Ok(mut dir) = fs.open_volume() else {
+        return false;
+    };
+    dir.open(&path_c, FileMode::Read, uefi::proto::media::file::FileAttribute::empty())
+        .is_ok()
+}
+
 /// Formatted variant: substitutes `{}` with `family` then reads.
 pub fn read_boot_file_fmt(pattern: &str, family: &str) -> Option<alloc::vec::Vec<u8>> {
     let path = alloc::format!("{}", pattern.replacen("{}", family, 1));
     read_boot_file(&path)
 }
 
+/// Read one ASSET (never a marker) with the three states kept apart:
+/// `Ok(None)` = not on the stick (the caller may legitimately run without it),
+/// `Err(())` = present but unusable (empty, over the cap, short read, media
+/// pulled). Collapsing that second state into `None` is how a damaged `v67-*.bin`
+/// silently downgrades an unlock run to chain-replay instead of refusing.
+pub fn read_asset(path: &str) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    match read_boot_file_inner(path) {
+        Inner::Absent => Ok(None),
+        Inner::Failed => Err(()),
+        Inner::Content(v) => Ok(Some(v)),
+    }
+}
+
+/// Formatted variant of [`read_asset`].
+pub fn read_asset_fmt(pattern: &str, family: &str) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    let path = alloc::format!("{}", pattern.replacen("{}", family, 1));
+    read_asset(&path)
+}
+
+enum Inner {
+    Absent,
+    Failed,
+    Content(alloc::vec::Vec<u8>),
+}
+
 /// Read one file from the boot volume with per-step diagnostics.
 pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match read_boot_file_inner(path) {
+        Inner::Content(v) => Some(v),
+        _ => None,
+    }
+}
+
+fn read_boot_file_inner(path: &str) -> Inner {
     // Runtime path: CString16::try_from (cstr16! only takes literals).
     let path_c = match uefi::CString16::try_from(path) {
         Ok(p) => p,
-        Err(_) => { info!("TX-ASSET-DIAG: {path} not UCS-2 convertible"); return None; }
+        Err(_) => { info!("TX-ASSET-DIAG: {path} not UCS-2 convertible"); return Inner::Failed; }
     };
     let path: &uefi::CStr16 = &path_c;
     use alloc::vec::Vec;
@@ -777,36 +829,40 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
 
     let mut fs = match boot::get_image_file_system(boot::image_handle()) {
         Ok(fs) => fs,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} fs open failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} fs open failed {:?}", e.status()); return Inner::Failed; }
     };
     let mut dir = match fs.open_volume() {
         Ok(d) => d,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} open_volume failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} open_volume failed {:?}", e.status()); return Inner::Failed; }
     };
     let file = match dir.open(path, FileMode::Read, FileAttribute::empty()) {
         Ok(f) => f,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} OPEN failed {:?}", e.status()); return None; }
+        Err(e) => {
+            // NOT_FOUND is the one error that means "the stick does not carry it".
+            if e.status() == uefi::Status::NOT_FOUND {
+                info!("TX-ASSET-DIAG: {path} absent");
+                return Inner::Absent;
+            }
+            info!("TX-ASSET-DIAG: {path} OPEN failed {:?}", e.status());
+            return Inner::Failed;
+        }
     };
     let mut file = match file.into_regular_file() {
         Some(f) => f,
-        None => { info!("TX-ASSET-DIAG: {path} not a regular file"); return None; }
+        None => { info!("TX-ASSET-DIAG: {path} not a regular file"); return Inner::Failed; }
     };
-    // Exact size first (preallocate once - no 84MB realloc churn).
     let size = match file.get_boxed_info::<FileInfo>() {
         Ok(info) => info.file_size() as usize,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} get_info failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} get_info failed {:?}", e.status()); return Inner::Failed; }
     };
-    // A FAT entry that reports garbage (0 or absurd) must fail here instead of
-    // aborting the allocator with a capacity the firmware cannot serve, and a
-    // short read must fail instead of handing a truncated image to the DMA
-    // copies (only V67 and the stock signature are length-checked downstream).
+    // An asset is never empty: the DMA copies use fixed windows, and a FAT entry
+    // that reports 0 or an absurd size is a damaged stick, not a flag file.
     const MAX_ASSET_BYTES: usize = 192 << 20;
     if size == 0 || size > MAX_ASSET_BYTES {
         info!("TX-ASSET-DIAG: {path} size {size} outside 1..={MAX_ASSET_BYTES} - refusing");
-        return None;
+        return Inner::Failed;
     }
     let mut out = Vec::with_capacity(size);
-    unsafe { out.set_len(0); }
     let mut chunk = [0u8; 65536];
     let mut got = 0usize;
     while got < size {
@@ -814,15 +870,15 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
         match file.read(&mut chunk[..want]) {
             Ok(0) => { info!("TX-ASSET-DIAG: {path} EOF at {got}/{size}"); break; }
             Ok(n) => { out.extend_from_slice(&chunk[..n]); got += n; }
-            Err(e) => { info!("TX-ASSET-DIAG: {path} read err at {got}/{size}: {:?}", e.status()); return None; }
+            Err(e) => { info!("TX-ASSET-DIAG: {path} read err at {got}/{size}: {:?}", e.status()); return Inner::Failed; }
         }
     }
     if got != size {
         info!("TX-ASSET-DIAG: {path} short read {got}/{size} - refusing (damaged stick or pulled media)");
-        return None;
+        return Inner::Failed;
     }
     info!("TX-ASSET-DIAG: {path} loaded {}/{} bytes", out.len(), size);
-    Some(out)
+    Inner::Content(out)
 }
 
 /// Assets for the transaction, loaded from the boot volume (tx builds
@@ -887,7 +943,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // failure, continue the unwind with a selector probe instead of
     // aborting. Default OFF; see the FORCE-CONTINUE banner at the failure
     // site for what the experiment can and cannot show.
-    let force_continue = read_boot_file("\\tx-force-continue.txt").is_some();
+    let force_continue = probe_file("\\tx-force-continue.txt");
     if force_continue {
         info!("TX: force-continue marker present - booter-stage failures fall through to the selector probe");
     }
@@ -897,7 +953,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // driver-exact configuration. Gated to 'tu10x' so GA10x/Ada keep the
     // allocation path they were field-verified with. \tx-low-staging.txt
     // reverts even tu10x to the legacy path (A/B testing).
-    let high_staging = assets.family == "tu10x" && read_boot_file("\\tx-low-staging.txt").is_none();
+    let high_staging = assets.family == "tu10x" && !probe_file("\\tx-low-staging.txt");
     crate::pci::set_high_staging(high_staging);
     info!("TX: >4GB staging gate: {high_staging} (family {})", assets.family);
 
@@ -1091,7 +1147,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     const OFF_RADIX: u64 = 0x2_0000;
     let mut meta_addr = meta_dma.dev;
     let mut vram_fb = false;
-    if read_boot_file("\\tx-meta-in-vram.txt").is_some() {
+    if probe_file("\\tx-meta-in-vram.txt") {
         // Retarget the radix tables in place: every entry moves by the same
         // delta (tables and leaves are copied as one block).
         let leaves = assets.gsp_image.len().div_ceil(4096);
@@ -1206,7 +1262,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
             // as the Code-43 variable. Turing SS0/SS1 live at 0x409664/6c,
             // NOT the GA10x/Ada 0x82381c/820 (cmp50hx lines 294-296).
             let no_ss = assets.family == "tu10x"
-                && crate::tx::read_boot_file("\\tu10x-no-ss.txt").is_some();
+                && crate::tx::probe_file("\\tu10x-no-ss.txt");
             let (ss0_at, ss1_at) = if assets.family == "tu10x" {
                 (tb::TU10X_FEAT_SS0, tb::TU10X_FEAT_SS1)
             } else {
@@ -1305,7 +1361,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // the reconnect just restores the boot console earlier (Run A's
     // shape-change when it was removed turned out to be coincidental).
     // A \tu10x-no-reconnect.txt marker skips it again for experiments.
-    if assets.family == "tu10x" && crate::tx::read_boot_file("\\tu10x-no-reconnect.txt").is_some() {
+    if assets.family == "tu10x" && crate::tx::probe_file("\\tu10x-no-reconnect.txt") {
         info!("TX-tu10x: reconnect skipped (tu10x-no-reconnect marker)");
     } else {
         crate::tx_detach::reconnect_all(pci_handle);
