@@ -335,7 +335,20 @@ pub fn reconnect_all(pci_handle: uefi::Handle) {
     // stack over the stale child and the platform resets inside the call.
     // bootmgfw locates the fresh vendor GOP on its own.
     boot::stall(core::time::Duration::from_millis(200));
-    let recursive = !stale_pathless_gop();
+    // Diagnostic switch (issues #35/#61): on a family of boards the
+    // recursive rebind deadlocks inside the firmware right here (detach
+    // leaves zero GOP handles -> stale_pathless_gop()=false ->
+    // recursive=true). The marker forces the vendor-GOP-only bind PR#13
+    // validated on the pathless-survivor shape and leaves the console
+    // stack to bootmgfw - the Z170-A control proved bootmgfw's own
+    // re-establishment suffices whenever it can bind at all.
+    let force_nonrec = crate::tx::read_boot_file("\\tx-reconnect-nonrecursive.txt").is_some();
+    let recursive = if force_nonrec {
+        info!("RECONNECT: \\tx-reconnect-nonrecursive.txt present - forcing NON-recursive (vendor GOP bind only; console stack left to bootmgfw)");
+        false
+    } else {
+        !stale_pathless_gop()
+    };
     info!("RECONNECT: ConnectController (recursive={recursive}) begin");
     match boot::connect_controller(pci_handle, &[], None, recursive) {
         Ok(()) => info!("RECONNECT: ConnectController ok (recursive={recursive})"),

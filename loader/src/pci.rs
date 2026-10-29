@@ -764,6 +764,90 @@ pub fn log_dma_path(tag: &str, gpu: &PciIo) {
     }
 }
 
+/// Read-only handoff-time PCI snapshot (issue #61 ask #2): GPU config
+/// header, capability walk (PCIe DevCtl/LnkCtl + MSI enable), and every
+/// bridge's Command / Bridge Control (VGA routing bits). Runs after the
+/// FLR/verify phase and before the reconnect, so the log pairs directly
+/// with the Windows-side pnputil dump of the same boot: a resource-class
+/// delta between the two pinpoints which side changed what.
+#[cfg(feature = "tx")]
+pub fn diag_handoff_pci(gpu: &PciIo) {
+    info!(
+        "HANDOFF-PCI gpu cfg00-1f: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        gpu.config_read_u32(0x00),
+        gpu.config_read_u32(0x04),
+        gpu.config_read_u32(0x08),
+        gpu.config_read_u32(0x0c),
+        gpu.config_read_u32(0x10),
+        gpu.config_read_u32(0x14),
+        gpu.config_read_u32(0x18),
+        gpu.config_read_u32(0x1c),
+    );
+    info!(
+        "HANDOFF-PCI gpu cfg20-3f: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        gpu.config_read_u32(0x20),
+        gpu.config_read_u32(0x24),
+        gpu.config_read_u32(0x28),
+        gpu.config_read_u32(0x2c),
+        gpu.config_read_u32(0x30),
+        gpu.config_read_u32(0x34),
+        gpu.config_read_u32(0x38),
+        gpu.config_read_u32(0x3c),
+    );
+    // Capability walk from the 0x34 pointer; PCIe (0x10) and MSI (0x05)
+    // get field decodes, anything else is listed by id. Bounded so a
+    // poisoned pointer cannot loop.
+    let mut ptr = gpu.config_read_u8(0x34) as u32;
+    for _ in 0..16 {
+        if ptr == 0 || ptr >= 0xff {
+            break;
+        }
+        let id = gpu.config_read_u8(ptr);
+        let next = gpu.config_read_u8(ptr + 1) as u32;
+        match id {
+            0x10 => info!(
+                "HANDOFF-PCI cap PCIe@{ptr:#04x}: devcap={:#06x} devctl={:#06x} devsta={:#06x} lnkcap={:#08x} lnkctl={:#06x} lnksta={:#06x}",
+                gpu.config_read_u16(ptr + 4),
+                gpu.config_read_u16(ptr + 8),
+                gpu.config_read_u16(ptr + 0xa),
+                gpu.config_read_u32(ptr + 0xc),
+                gpu.config_read_u16(ptr + 0x10),
+                gpu.config_read_u16(ptr + 0x12),
+            ),
+            0x05 => info!(
+                "HANDOFF-PCI cap MSI@{ptr:#04x}: mc={:#06x}",
+                gpu.config_read_u16(ptr + 2)
+            ),
+            other => info!("HANDOFF-PCI cap id={other:#04x}@{ptr:#04x}"),
+        }
+        ptr = next;
+    }
+    let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&PciIo::GUID)) else {
+        info!("HANDOFF-PCI bridge scan: locate_handle_buffer failed");
+        return;
+    };
+    for handle in handles.iter() {
+        // Safety: GetProtocol performs no driver binding (same as log_dma_path).
+        let Ok(pci) = (unsafe {
+            boot::open_protocol::<PciIo>(
+                OpenProtocolParams { handle: *handle, agent: boot::image_handle(), controller: None },
+                OpenProtocolAttributes::GetProtocol,
+            )
+        }) else {
+            continue;
+        };
+        if pci.config_read_u16(0x00) == 0xffff || pci.config_read_u8(0x0e) & 0x7f != 0x01 {
+            continue;
+        }
+        let loc = pci.get_location();
+        info!(
+            "HANDOFF-PCI bridge {loc:?} cmd={:#06x} bridgectl={:#06x}",
+            pci.config_read_u16(0x04),
+            pci.config_read_u16(0x3e)
+        );
+    }
+}
+
 /// Bus-master guard for the PCI bridges between the root complex and the GPU.
 ///
 /// `enable` sets COMMAND bit 2 (bus master) on every PCI-to-PCI bridge in the

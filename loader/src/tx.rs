@@ -1239,8 +1239,16 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
         let plm_rb = gpu.pci.bar_read_u32(0, 0x0040_9650 as u64);
         let ss0_rb = gpu.pci.bar_read_u32(0, 0x0040_9664 as u64);
         let ss1_rb = gpu.pci.bar_read_u32(0, 0x0040_966c as u64);
+        // Once the payload opened the block, bits 5:6 resist host clears:
+        // 0xffffffef is the proven handoff end state (TU106 and TU104
+        // identical); a full 0xffffff8f readback would be the surprise.
+        let plm_note = match plm_rb {
+            0xffff_ffef => "known-good (bits 5:6 sticky-open)",
+            0xffff_ff8f => "fully closed",
+            _ => "UNEXPECTED",
+        };
         info!(
-            "TU10X PLM relock: plm={plm_rb:#010x} (want 0xffffff8f) SS0={ss0_rb:#010x} SS1={ss1_rb:#010x} unlock_persist={}",
+            "TU10X PLM relock: plm={plm_rb:#010x} {plm_note} SS0={ss0_rb:#010x} SS1={ss1_rb:#010x} unlock_persist={}",
             ss0_rb == 0x8888_8888 && ss1_rb == 0x8
         );
     }
@@ -1274,6 +1282,10 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
         tb::flr_phase(gpu, assets.family, flr_expect_unlock)?;
         info!("POST-FLR: verified{}", if flr_expect_unlock { " (selectors survive AON)" } else { "" });
     }
+
+    // Read-only handoff PCI snapshot (issue #61 ask #2): the config state
+    // Windows will inherit, logged before the reconnect touches anything.
+    crate::pci::diag_handoff_pci(gpu.pci);
 
     // Restore the display path before handing off (TOTORONG craft): the
     // FLR-rebooted function re-binds its vendor GOP/driver stack. Non-fatal
