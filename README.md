@@ -442,6 +442,25 @@ FP16 46.78 → **75.28** TFLOPS（`docs/evidence/ad106-4060ti-desktop/`，
 > 术语注意：任务管理器的"虚拟化"只反映 SVM/VT-x；桥的 Bus Master 是 PCI
 > Command Register bit 2，与"虚拟化"完全无关。
 
+### 已知问题（已在 loader 内修复）：AMI 固件的无路径 GOP 子句柄导致事务成功后平台复位
+
+**现象**：事务全链通过（`MAILBOX0=0x67b00001`、PLM 读回正确、`POST-FLR: verified`），但在进入
+Windows 之前整机复位或黑屏卡死。v2.1.5 之前的构建在这种情况下 `loader.log` 为 0 字节，因为日志只在
+链式加载前才写盘。
+
+**根因**（PR #13，在 ASUS ROG MAXIMUS Z790 APEX + RTX 4060 Ti 8 GB 上发现）：该 AMI 固件在 NVIDIA
+GOP 之上叠加了一个**没有设备路径的 GOP 子句柄**（固件的分屏/控制台句柄）。断开驱动时 NVIDIA GOP
+被移除，但这个无路径子句柄保留了下来。随后的**递归** `ConnectController` 会把控制台栈重新绑定到这个
+失效的子句柄上，平台在调用内部复位。有两处这样做：post-FLR 判定之后的 `reconnect_all`，以及
+`chain_load_bootmgfw` 中类似 `map -r` 的重连（会对包括 GPU 在内的每个 PciIo 句柄递归连接）。
+
+**修复**：已内置于 loader（PR #13；节点对齐的 GOP 归属判断见 `fe92339`）。重连默认仍为递归（单 GOP
+主机板行为不变），只有当断开后仍残留无路径 GOP 时才只连接厂商 GOP（非递归）；链式加载前的重连跳过
+NVIDIA 显示功能；`loader.log` 在运行过程中即写盘。受影响的主机板日志会出现
+`RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)`；若仍有异常，可在 U 盘根目录
+放 `\no-reconnect.txt` 完全跳过重连。证据见 `docs/evidence/ad106-asus-z790/`，完整报告见
+`docs/ad106-asus-z790-windows-unlock.md`。
+
 > 维护者**非全职**，可能无法随时查看并回复 issue，敬请谅解——日志会保留，
 > 有进展会回。
 
