@@ -346,6 +346,7 @@ pub fn wpr_meta_pack(
         let hs = match fb_size {
             0x280000000 => 0x7F00000, // 10 GiB
             0x500000000 => 0xFE00000, // 20 GiB
+            0x580000000 => 0x6B00000, // 22 GiB (TU102 22G mod: issue #17, C ref build_wpr_meta)
             _ => 0x6900000,           // 8 GiB (40HX live value)
         };
         let ho = (layout.gsp_offset - hs) & !(MB - 1);
