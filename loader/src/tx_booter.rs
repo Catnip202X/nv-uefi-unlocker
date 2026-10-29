@@ -933,8 +933,11 @@ pub fn flr_phase(gpu: &TxGpu, family: &str, payload_mode: bool) -> Result<(), Tx
     // dword and the reset would silently never happen.
     let pcie = crate::pci::pcie_cap_or_measured(gpu.pci);
     let devcap = gpu.pci.config_read_u32(pcie as u32 + 0x04);
-    if devcap & (1 << 15) == 0 {
-        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR - continuing (the reset may be a no-op, and a payload verdict must not be lost to it)");
+    // PCI_EXP_DEVCAP_FLR = bit 28, not 15: bit 15 is the low bit of the L1
+    // Acceptable Latency field, so the old test warned on cards with L1
+    // latency 0 or 2 regardless of their FLR support.
+    if devcap & (1 << 28) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR (bit 28 clear) - continuing (the reset may be a no-op, and a payload verdict must not be lost to it)");
     }
     let devctl = gpu.pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {

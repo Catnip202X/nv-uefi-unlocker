@@ -244,12 +244,18 @@ fn tx_one_card(g: &pci::FoundGpu) {
             info!("TX: aborted on warm/resume entry before any GPU write - chain-loading unchanged Windows (use a Restart or cold boot)");
             tx::handoff_out(&pci);
         }
-        // The cold-state guard refused: WPR2 was already initialized this
-        // power cycle, so no GPU register was written (claim_guards runs ahead
-        // of the first write). There is nothing to unwind, and an FLR here
-        // would only disturb a card the OS driver legitimately owns.
+        // The cold-state guard refused: WPR2 was already initialized this power
+        // cycle, i.e. a driver owned this card before we did. By here the card
+        // has already been touched in CONFIG space - detach_and_claim ran first
+        // (console drivers disconnected, IO|MEM|BME enabled through the COMMAND
+        // register, config baseline captured) - but no MMIO register was
+        // written and nothing was reset. No FLR: WPR2-up means a driver
+        // initialized the card, and resetting it would be a state change we
+        // would then have to reconstruct. The captured baseline is not restored
+        // either; the handoff leaves it to the OS driver, which re-initialises
+        // the function anyway.
         Err(tx::TxError::EBusy) => {
-            info!("TX: refused (EBUSY: WPR2 already initialized this power cycle) - no GPU register was written, no FLR");
+            info!("TX: refused (EBUSY: WPR2 already initialized this power cycle) - config space touched + console detached by the claim, no MMIO write, no reset, baseline not restored");
             tx::handoff_out(&pci);
         }
         Err(e) => {

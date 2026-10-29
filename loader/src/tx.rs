@@ -651,7 +651,7 @@ pub fn list_root_entries() {
     // Directory = FileHandle; read entries RAW (RegularFile::read) and parse
     // the EFI_FILE_INFO layout ourselves: size/file_size/physical_size
     // (3x u64 = 24), 3x Time (16B each = 48), attribute u64 = 72, name
-    // UCS-2 from offset 72. This bypasses uefi's entry API, whose error
+    // UCS-2 from offset 80. This bypasses uefi's entry API, whose error
     // path instantiates CStr16 helpers that reference wcslen under LTO.
     let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else {
         info!("TX-ASSET-DIAG: get_image_file_system FAILED");
@@ -1364,8 +1364,12 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
     // NO access at all (PCI spec: the function need not respond).
     let pcie = crate::pci::pcie_cap_or_measured(pci);
     let devcap = pci.config_read_u32(pcie as u32 + 0x04);
-    if devcap & (1 << 15) == 0 {
-        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR - the reset below may be a no-op");
+    // PCI_EXP_DEVCAP_FLR = bit 28 (Linux pci_regs.h; gpu-unlock's compat.h
+    // agrees). Bit 15 is the low bit of the L1 Acceptable Latency field
+    // (DEVCAP[17:15]), so testing it warned on every card whose L1 latency
+    // happened to be 0 or 2.
+    if devcap & (1 << 28) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR (bit 28 clear) - the reset below may be a no-op");
     }
     let devctl = pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {
