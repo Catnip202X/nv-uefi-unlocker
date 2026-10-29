@@ -516,6 +516,71 @@ pub fn gfw_wait(gpu: &TxGpu) -> Result<(), TxError> {
     gpu.poll_us(regs::GFW_BOOT, 0xff, regs::GFW_BOOT_COMPLETED, 2_050_000, true)
 }
 
+/// C-reference host probe writes (issue #17/#62 matrix, \tx-host-probe.txt).
+/// The reference's own log proves these writes change some writable bits in
+/// the FEAT PLM/SS block, so it cannot be reduced to a read-only check; the
+/// side effects are the experiment. PLM ends at 0xfffffffe (not
+/// 0xffffffff), so the upstream Turing EALREADY guard cannot false-trigger
+/// on a later run; SS0 ends at the probe pattern, not the unlock value.
+fn host_probe_reference(gpu: &TxGpu) {
+    const PLM: u32 = 0x0040_9650;
+    const SS0: u32 = 0x0040_9664;
+    const SS1: u32 = 0x0040_966c;
+    info!("HOST-PROBE: \\tx-host-probe.txt present - replaying the reference write sequence (write-surface probe, side effects intended)");
+    for (name, reg, v) in [("PLM", PLM, u32::MAX), ("SS0", SS0, 0x8888_8888), ("SS1", SS1, 8)] {
+        gpu.write32(reg, v);
+        let rb = gpu.read32(reg).unwrap_or(0xbadf_0000);
+        info!("HOST-PROBE: open pass {name} <- {v:#010x} readback={rb:#010x}");
+    }
+    let (s0, s1) = (gpu.read32(SS0).unwrap_or(0), gpu.read32(SS1).unwrap_or(0));
+    if s0 == 0x8888_8888 && s1 == 8 {
+        info!("HOST-PROBE: SS already at unlock values after the open pass - write surface reachable");
+    }
+    for (name, reg, v) in [
+        ("PLM", PLM, 0u32),
+        ("PLM", PLM, 0xffff_fffe),
+        ("SS0", SS0, 0x1111_1111),
+        ("SS1", SS1, 0),
+    ] {
+        gpu.write32(reg, v);
+        let rb = gpu.read32(reg).unwrap_or(0xbadf_0000);
+        info!("HOST-PROBE: settle pass {name} <- {v:#010x} readback={rb:#010x}");
+    }
+}
+
+/// C-reference PTIMER seed (issue #17/#62 matrix, \tx-ptimer-seed.txt). PLM
+/// anti-replay validation needs sane GPU time; the reference seeds from the
+/// RTC but OMITS the day-of-month field ("month start + h:m:s"). The quirk
+/// is preserved verbatim to reproduce the proven run - this is a reference
+/// replay, not a precise wall clock.
+fn ptimer_seed_reference(gpu: &TxGpu) {
+    let Some(t) = uefi::runtime::get_time().ok() else {
+        info!("PTIMER-SEED: RTC unavailable - skipped");
+        return;
+    };
+    let year = u64::from(t.year().max(1970));
+    let month = u64::from(t.month().clamp(1, 12));
+    let leap = |y: u64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mut days = 0u64;
+    for y in 1970..year {
+        days += 365 + u64::from(leap(y));
+    }
+    for m in 1..month {
+        days += [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(m - 1) as usize];
+        if m == 2 && leap(year) {
+            days += 1;
+        }
+    }
+    let ns = (days * 86400
+        + u64::from(t.hour()) * 3600
+        + u64::from(t.minute()) * 60
+        + u64::from(t.second()))
+        * 1_000_000_000;
+    gpu.write32(0x0000_9410, (ns >> 32) as u32);
+    gpu.write32(0x0000_9400, ns as u32);
+    info!("PTIMER-SEED: reference seed={ns:#x} (month-start + h:m:s, day field omitted per the reference)");
+}
+
 /// falcon_hs full port (unlock_610.c 347-432): prevalidate -> reset ->
 /// FBIF physical mode -> code/data DMAs -> signature/selection regs ->
 /// boot vector + mailboxes -> start (CPUCTL alias path aware) -> wait.
@@ -919,6 +984,22 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // state: localizes the SEC2 start-authority gate before any reset.
     authority_scan(gpu);
 
+    // Issue #17/#62 matrix (Turing, marker-gated, default OFF): two
+    // environment steps the C reference performs and the plain path never
+    // does. \tx-host-probe.txt replays its host probe writes (its own log
+    // proves they change some PLM/SS writable bits - NOT a read-only
+    // diagnostic); \tx-ptimer-seed.txt seeds PTIMER from the RTC (PLM
+    // anti-replay validation needs sane GPU time; the reference omits the
+    // day-of-month field - preserved verbatim, not a precise wall clock).
+    if assets.family == "tu10x" {
+        if read_boot_file("\\tx-host-probe.txt").is_some() {
+            host_probe_reference(gpu);
+        }
+        if read_boot_file("\\tx-ptimer-seed.txt").is_some() {
+            ptimer_seed_reference(gpu);
+        }
+    }
+
     // The kernel AD102 driver runs the SEC2 scrubber before FWSEC, but the
     // community unlock chains (unlock_610.c "GA102 has no scrubber" + every
     // gpu-unlock-ada card through 28e1) boot FWSEC/booter WITHOUT one - and
@@ -1127,7 +1208,15 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // whole image is port-loaded NS+SEC+DMEM with BOOTVEC=0; the GA10x/Ada
     // BootFromHs path loads only the secure segment through BROM params.
     if assets.family == "tu10x" {
-        tb::booter_fire_direct(gpu, &hdr, booter_view, meta_addr)?;
+        if read_boot_file("\\tx-sec2-c-load.txt").is_some() {
+            // Issue #17/#62 matrix: full C-reference fire (no reset, FBIF
+            // CTL bit7 without TRANSCFG rewrite, 3s quiet window). Default
+            // OFF - the field-proven shape above stays the default.
+            info!("TX-tu10x: \\tx-sec2-c-load.txt present - C-reference SEC2 fire (no reset, quiet window)");
+            tb::booter_fire_direct_c(gpu, &hdr, booter_view, meta_addr)?;
+        } else {
+            tb::booter_fire_direct(gpu, &hdr, booter_view, meta_addr)?;
+        }
     } else {
         // Canonical wait split (unlock_610.c falcon_hs): the GA102 V67's
         // tail is the fill self-loop - the booter never halts and writes no
