@@ -344,11 +344,17 @@ pub fn wpr_meta_pack(
     let (nonwpr_off, nonwpr_size, wpr_start, heap_off, heap_size, flags) = if family == "tu10x" {
         const MB: u64 = 1024 * 1024;
         let hs = match fb_size {
-            0x280000000 => 0x7F00000, // 10 GiB
-            0x500000000 => 0xFE00000, // 20 GiB
+            0x280000000 => 0x7F00000, // 10 GiB (GA102-sourced legacy row; no Turing 10G SKU known)
+            0x500000000 => 0xFE00000, // 20 GiB (GA102-sourced legacy row; no Turing 20G SKU known)
             0x580000000 => 0x6B00000, // 22 GiB (TU102 22G mod: issue #17, C ref build_wpr_meta)
+            0x600000000 => 0x6B00000, // 24 GiB (TITAN RTX: issue #57)
             _ => 0x6900000,           // 8 GiB (40HX live value)
         };
+        // TU10x driver formula (RM 615.71.09 source, issue #57): heap =
+        // 8 MiB + align_1MiB(96 KiB x GiB) + 96 MiB (osCarveout=0 on TU102).
+        // Reproduces every hardware-verified row: 8G->105 MiB (40HX dump),
+        // 22G->107 MiB (#17), 24G->107 MiB (#57); the two GA102 rows above
+        // do NOT fit it and only apply to cards this tu10x path never sees.
         let ho = (layout.gsp_offset - hs) & !(MB - 1);
         let ws = ho - MB;
         info!(
