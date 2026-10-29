@@ -29,6 +29,8 @@ v2.1.0 起 30 系全系兼容。** 支持矩阵：
   FP16 GEMM 29.89 → 49.33 TFLOPS（1.65×）。完整报告见
   [docs/ada28e0-uefi-report.md](docs/ada28e0-uefi-report.md)。
 
+- **RTX 16 系（Turing）理论兼容，欢迎大家实机测试
+
 三代机制差异见 [兼容性矩阵](#兼容性矩阵)（Turing 的 FEAT 块在 0x4096xx、
 FLR 会重锁 PLM、Windows 驱动需 GSP 模式——均与 Ada 不同）。
 
