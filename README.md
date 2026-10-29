@@ -57,6 +57,7 @@ FLR 会重锁 PLM、Windows 驱动需 GSP 模式——均与 Ada 不同）。
 | `tx-select-bdf.txt` | 多卡钉卡：内容 `bb:dd.f` 或 `dddd:bb:dd.f`（十六进制） | 可选 |
 | `i_know_what_i_am_doing.txt` | **武装模式**：确认环节变为 5 秒倒计时后自动运行，倒计时内按任意键终止（无人值守/自动化用；文件存在即意图声明，内容忽略） | 可选 |
 | `chain-target.txt` | 链回目标钉定：第一个非空且非 `#` 的行 = 优先尝试的 EFI 路径（如 `\EFI\limine\limine_x64.efi`），逐卷尝试；全卷找不到则回退默认顺序并留痕（issue #8 建议） | 可选 |
+| `no-reconnect.txt` | 事务完成后跳过目标卡 GOP/控制台重连：重连只是提前恢复画面（bootmgfw 会自建控制台），个别 AMI 固件在重连时卡死/复位平台（见下方已知问题）——日志若停在 `RECONNECT: ConnectController ... begin`，重跑时在盘根放此文件 | 可选 |
 | `\loader.log` | （运行产物）全部阶段日志，evidence record | 输出 |
 
 表中使用 Ada 资产名；GA10x 和 Turing 分别在 maker 中选择 `ga102`、`tu10x`。启动文件放在 `\EFI\BOOT\BOOTX64.EFI`，所选家族的 `.bin` 与可选标记文件放在盘根。当前 maker 输出为平铺目录，还含抽取中间文件：按脚本末尾 `expected` 清单选取该家族文件，并为启动文件建立 `EFI/BOOT/` 目录，不必复制全部中间固件镜像。
