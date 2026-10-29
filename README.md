@@ -10,7 +10,7 @@ Windows Boot Manager。
 **当前状态：40 系（AD10x）+ 30 系（GA10x）+ 20 系（TU10x）三轨闭环——
 v2.1.0 起 30 系全系兼容。** 支持矩阵：
 
-- **RTX 20 系（Turing）✅ 实测支持（v0.2.0）**——RTX 2070（TU106, `10de:1f07`）
+- **RTX 20 系（Turing）✅ 全系兼容 实测支持（v0.2.0）**——RTX 2070（TU106, `10de:1f07`）
   全链解锁：**FP32 累加 GEMM 36 → 60–63 TFLOPS（+67~75%）**；2060 Super
   （`10de:1f06`）社区实测同链通过（[issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12)）。
   **Turing 用户
@@ -24,7 +24,7 @@ v2.1.0 起 30 系全系兼容。** 支持矩阵：
   均通过）；同链在上游社区工具已覆盖 3060（2487，+58~85%）。**30 系用户
   无需** Turing 的 GSP 固件模式前置。
   补充实测：3080（`2206`）、3070 Laptop（`249d`）、3080 Ti Laptop（`2420`），见[社区验证汇总](docs/community-reports.md)。
-- **RTX 40 系（Ada）✅ 实测支持**——RTX 4060 Laptop（`10de:28e0`，AD107M）
+- **RTX 40 系（Ada）✅ 全系兼容 实测支持**——RTX 4060 Laptop（`10de:28e0`，AD107M）
   四写解锁双端验证：固件侧 marker `0x67b00001` + 四 PLM 读回，Windows 侧
   FP16 GEMM 29.89 → 49.33 TFLOPS（1.65×）。完整报告见
   [docs/ada28e0-uefi-report.md](docs/ada28e0-uefi-report.md)。
