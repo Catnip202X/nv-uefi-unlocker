@@ -1,5 +1,9 @@
 # nv-uefi-unlocker
 
+[项目宣传片（Bilibili）](https://www.bilibili.com/video/BV1d6xN66ECM/)
+[原理科普 - 专业用户友好版（Bilibili）](https://www.bilibili.com/opus/1264436370549506065)
+[原理科普 - 入门用户友好版（Bilibili）](https://www.bilibili.com/opus/1264493051219279872)
+
 [中文](README.md) | [English](README.en.md)
 
 20 \~ 40系 全平台操作系统通用 UEFI 预驱动 NVIDIA GPU 解锁器（开发环境为 Windows，Rust）。在 NVIDIA 驱动加载**之前**的
