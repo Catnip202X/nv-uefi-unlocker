@@ -350,7 +350,7 @@ pub fn wpr_meta_pack(
         // reference), 24G -> 107 MiB (TITAN RTX, issue #57). Replaces the
         // per-size table; the old 10G/20G rows were GA102-sourced and never
         // applied to a Turing SKU.
-        let gib = fb_size >> 30;
+        let gib = (fb_size + ((1 << 30) - 1)) >> 30; // driver: ALIGN_UP64(fbSize, 1GiB) >> 30
         let hs = (8 * MB) + ((((96 << 10) * gib) + MB - 1) & !(MB - 1)) + (96 * MB);
         let ho = (layout.gsp_offset - hs) & !(MB - 1);
         let ws = ho - MB;
