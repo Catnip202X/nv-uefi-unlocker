@@ -1,8 +1,10 @@
 # nv-uefi-unlocker
 
-[项目宣传片（Bilibili）](https://www.bilibili.com/video/BV1d6xN66ECM/)
-[原理科普 - 专业用户友好版（Bilibili）](https://www.bilibili.com/opus/1264436370549506065)
-[原理科普 - 入门用户友好版（Bilibili）](https://www.bilibili.com/opus/1264493051219279872)
+[项目宣传片（Bilibili, 简体中文）](https://www.bilibili.com/video/BV1d6xN66ECM/)
+
+[原理科普 - 专业用户友好版（Bilibili, 简体中文）](https://www.bilibili.com/opus/1264436370549506065)
+
+[原理科普 - 入门用户友好版（Bilibili, 简体中文）](https://www.bilibili.com/opus/1264493051219279872)
 
 [中文](README.md) | [English](README.en.md)
 
