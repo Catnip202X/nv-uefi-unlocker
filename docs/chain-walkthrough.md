@@ -1,5 +1,7 @@
 # 链条分步对照：我们 / TOTORONG / Linux kernel（gpu-unlock-ada）
 
+> 勘误（2026-10-28）：本文是 2026-10-26 的过程记录。顶部对 28e1 的 IOMMU 归因已被后续桥 BME 实验推翻，见[根因报告](bridge-bme-root-cause.md)。当前家族判据和实现限制见[社区汇总](community-reports.md)。
+
 日期：2026-10-26。依据：gpu-unlock-ada 全家桶（unlock_610.c + 15 卡报告）、
 TOTORONG AD103_win_unlocker 源码、我们 28e0 实测日志（至 EFI c0fce9ac）。
 

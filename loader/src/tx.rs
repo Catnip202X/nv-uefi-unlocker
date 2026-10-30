@@ -516,6 +516,71 @@ pub fn gfw_wait(gpu: &TxGpu) -> Result<(), TxError> {
     gpu.poll_us(regs::GFW_BOOT, 0xff, regs::GFW_BOOT_COMPLETED, 2_050_000, true)
 }
 
+/// C-reference host probe writes (issue #17/#62 matrix, \tx-host-probe.txt).
+/// The reference's own log proves these writes change some writable bits in
+/// the FEAT PLM/SS block, so it cannot be reduced to a read-only check; the
+/// side effects are the experiment. PLM ends at 0xfffffffe (not
+/// 0xffffffff), so the upstream Turing EALREADY guard cannot false-trigger
+/// on a later run; SS0 ends at the probe pattern, not the unlock value.
+fn host_probe_reference(gpu: &TxGpu) {
+    const PLM: u32 = 0x0040_9650;
+    const SS0: u32 = 0x0040_9664;
+    const SS1: u32 = 0x0040_966c;
+    info!("HOST-PROBE: \\tx-host-probe.txt present - replaying the reference write sequence (write-surface probe, side effects intended)");
+    for (name, reg, v) in [("PLM", PLM, u32::MAX), ("SS0", SS0, 0x8888_8888), ("SS1", SS1, 8)] {
+        gpu.write32(reg, v);
+        let rb = gpu.read32(reg).unwrap_or(0xbadf_0000);
+        info!("HOST-PROBE: open pass {name} <- {v:#010x} readback={rb:#010x}");
+    }
+    let (s0, s1) = (gpu.read32(SS0).unwrap_or(0), gpu.read32(SS1).unwrap_or(0));
+    if s0 == 0x8888_8888 && s1 == 8 {
+        info!("HOST-PROBE: SS already at unlock values after the open pass - write surface reachable");
+    }
+    for (name, reg, v) in [
+        ("PLM", PLM, 0u32),
+        ("PLM", PLM, 0xffff_fffe),
+        ("SS0", SS0, 0x1111_1111),
+        ("SS1", SS1, 0),
+    ] {
+        gpu.write32(reg, v);
+        let rb = gpu.read32(reg).unwrap_or(0xbadf_0000);
+        info!("HOST-PROBE: settle pass {name} <- {v:#010x} readback={rb:#010x}");
+    }
+}
+
+/// C-reference PTIMER seed (issue #17/#62 matrix, \tx-ptimer-seed.txt). PLM
+/// anti-replay validation needs sane GPU time; the reference seeds from the
+/// RTC but OMITS the day-of-month field ("month start + h:m:s"). The quirk
+/// is preserved verbatim to reproduce the proven run - this is a reference
+/// replay, not a precise wall clock.
+fn ptimer_seed_reference(gpu: &TxGpu) {
+    let Some(t) = uefi::runtime::get_time().ok() else {
+        info!("PTIMER-SEED: RTC unavailable - skipped");
+        return;
+    };
+    let year = u64::from(t.year().max(1970));
+    let month = u64::from(t.month().clamp(1, 12));
+    let leap = |y: u64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mut days = 0u64;
+    for y in 1970..year {
+        days += 365 + u64::from(leap(y));
+    }
+    for m in 1..month {
+        days += [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(m - 1) as usize];
+        if m == 2 && leap(year) {
+            days += 1;
+        }
+    }
+    let ns = (days * 86400
+        + u64::from(t.hour()) * 3600
+        + u64::from(t.minute()) * 60
+        + u64::from(t.second()))
+        * 1_000_000_000;
+    gpu.write32(0x0000_9410, (ns >> 32) as u32);
+    gpu.write32(0x0000_9400, ns as u32);
+    info!("PTIMER-SEED: reference seed={ns:#x} (month-start + h:m:s, day field omitted per the reference)");
+}
+
 /// falcon_hs full port (unlock_610.c 347-432): prevalidate -> reset ->
 /// FBIF physical mode -> code/data DMAs -> signature/selection regs ->
 /// boot vector + mailboxes -> start (CPUCTL alias path aware) -> wait.
@@ -651,7 +716,7 @@ pub fn list_root_entries() {
     // Directory = FileHandle; read entries RAW (RegularFile::read) and parse
     // the EFI_FILE_INFO layout ourselves: size/file_size/physical_size
     // (3x u64 = 24), 3x Time (16B each = 48), attribute u64 = 72, name
-    // UCS-2 from offset 72. This bypasses uefi's entry API, whose error
+    // UCS-2 from offset 80. This bypasses uefi's entry API, whose error
     // path instantiates CStr16 helpers that reference wcslen under LTO.
     let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else {
         info!("TX-ASSET-DIAG: get_image_file_system FAILED");
@@ -678,7 +743,14 @@ pub fn list_root_entries() {
         if n == 0 {
             break; // end of directory
         }
-        if n < 76 {
+        // EFI_FILE_INFO fixed part = 80 bytes: Size(8) + FileSize(8) +
+        // PhysicalSize(8) + 3x EFI_TIME(48) + Attribute(8); FileName[] is the
+        // CHAR16 array that starts at 80, not at 72 (reading 72 lands on the
+        // Attribute field: 0x20 = archive -> one space, then the name's NUL is
+        // never reached because the byte after Attribute is the first UCS-2
+        // character, so every entry logged a blank name).
+        const INFO_FIXED_LEN: usize = 80;
+        if n < INFO_FIXED_LEN + 2 {
             info!("TX-ROOT-DIR: short entry {n}");
             continue;
         }
@@ -686,8 +758,8 @@ pub fn list_root_entries() {
         let mut name = [0u8; 96];
         let mut m = 0usize;
         let mut chars = 0usize;
-        while chars + 1 < n - 72 && m + 1 < name.len() {
-            let u = u16::from_le_bytes([buf[72 + chars], buf[73 + chars]]);
+        while INFO_FIXED_LEN + chars + 1 < n && m + 1 < name.len() {
+            let u = u16::from_le_bytes([buf[INFO_FIXED_LEN + chars], buf[INFO_FIXED_LEN + chars + 1]]);
             if u == 0 { break; }
             name[m] = if (0x20..0x7f).contains(&u) { u as u8 } else { b'?' };
             m += 1;
@@ -707,7 +779,7 @@ fn pre_flr_experiment(handle: uefi::Handle) -> bool {
     // and our measured post-FLR state (GFW_BOOT stuck 0x101, both chips)
     // is an environment the kernel never sees. Default OFF so the next
     // round tests the kernel-matching sequence.
-    if read_boot_file("\\pre-flr-on.txt").is_none() {
+    if !probe_file("\\pre-flr-on.txt") {
         info!("PRE-FLR: disabled (no \\pre-flr-on.txt) - kernel-matching flow");
         return false;
     }
@@ -751,18 +823,70 @@ fn pre_flr_experiment(handle: uefi::Handle) -> bool {
     true
 }
 
+/// Does this path exist as a readable regular file? No size gate and no content:
+/// the UI switches are zero-byte marker files by design (`\tx-require-d0.txt`
+/// is documented as "drop an empty file"), so anything that treats "size 0" as
+/// "absent" silently disables them. Kept separate from the asset reader, whose
+/// size rules are about DMA windows, not about intent.
+pub fn probe_file(path: &str) -> bool {
+    let Ok(path_c) = uefi::CString16::try_from(path) else {
+        return false;
+    };
+    use uefi::proto::media::file::{File, FileMode};
+    let Ok(mut fs) = boot::get_image_file_system(boot::image_handle()) else {
+        return false;
+    };
+    let Ok(mut dir) = fs.open_volume() else {
+        return false;
+    };
+    dir.open(&path_c, FileMode::Read, uefi::proto::media::file::FileAttribute::empty())
+        .is_ok()
+}
+
 /// Formatted variant: substitutes `{}` with `family` then reads.
 pub fn read_boot_file_fmt(pattern: &str, family: &str) -> Option<alloc::vec::Vec<u8>> {
     let path = alloc::format!("{}", pattern.replacen("{}", family, 1));
     read_boot_file(&path)
 }
 
+/// Read one ASSET (never a marker) with the three states kept apart:
+/// `Ok(None)` = not on the stick (the caller may legitimately run without it),
+/// `Err(())` = present but unusable (empty, over the cap, short read, media
+/// pulled). Collapsing that second state into `None` is how a damaged `v67-*.bin`
+/// silently downgrades an unlock run to chain-replay instead of refusing.
+pub fn read_asset(path: &str) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    match read_boot_file_inner(path) {
+        Inner::Absent => Ok(None),
+        Inner::Failed => Err(()),
+        Inner::Content(v) => Ok(Some(v)),
+    }
+}
+
+/// Formatted variant of [`read_asset`].
+pub fn read_asset_fmt(pattern: &str, family: &str) -> Result<Option<alloc::vec::Vec<u8>>, ()> {
+    let path = alloc::format!("{}", pattern.replacen("{}", family, 1));
+    read_asset(&path)
+}
+
+enum Inner {
+    Absent,
+    Failed,
+    Content(alloc::vec::Vec<u8>),
+}
+
 /// Read one file from the boot volume with per-step diagnostics.
 pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match read_boot_file_inner(path) {
+        Inner::Content(v) => Some(v),
+        _ => None,
+    }
+}
+
+fn read_boot_file_inner(path: &str) -> Inner {
     // Runtime path: CString16::try_from (cstr16! only takes literals).
     let path_c = match uefi::CString16::try_from(path) {
         Ok(p) => p,
-        Err(_) => { info!("TX-ASSET-DIAG: {path} not UCS-2 convertible"); return None; }
+        Err(_) => { info!("TX-ASSET-DIAG: {path} not UCS-2 convertible"); return Inner::Failed; }
     };
     let path: &uefi::CStr16 = &path_c;
     use alloc::vec::Vec;
@@ -770,27 +894,40 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
 
     let mut fs = match boot::get_image_file_system(boot::image_handle()) {
         Ok(fs) => fs,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} fs open failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} fs open failed {:?}", e.status()); return Inner::Failed; }
     };
     let mut dir = match fs.open_volume() {
         Ok(d) => d,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} open_volume failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} open_volume failed {:?}", e.status()); return Inner::Failed; }
     };
     let file = match dir.open(path, FileMode::Read, FileAttribute::empty()) {
         Ok(f) => f,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} OPEN failed {:?}", e.status()); return None; }
+        Err(e) => {
+            // NOT_FOUND is the one error that means "the stick does not carry it".
+            if e.status() == uefi::Status::NOT_FOUND {
+                info!("TX-ASSET-DIAG: {path} absent");
+                return Inner::Absent;
+            }
+            info!("TX-ASSET-DIAG: {path} OPEN failed {:?}", e.status());
+            return Inner::Failed;
+        }
     };
     let mut file = match file.into_regular_file() {
         Some(f) => f,
-        None => { info!("TX-ASSET-DIAG: {path} not a regular file"); return None; }
+        None => { info!("TX-ASSET-DIAG: {path} not a regular file"); return Inner::Failed; }
     };
-    // Exact size first (preallocate once - no 84MB realloc churn).
     let size = match file.get_boxed_info::<FileInfo>() {
         Ok(info) => info.file_size() as usize,
-        Err(e) => { info!("TX-ASSET-DIAG: {path} get_info failed {:?}", e.status()); return None; }
+        Err(e) => { info!("TX-ASSET-DIAG: {path} get_info failed {:?}", e.status()); return Inner::Failed; }
     };
+    // An asset is never empty: the DMA copies use fixed windows, and a FAT entry
+    // that reports 0 or an absurd size is a damaged stick, not a flag file.
+    const MAX_ASSET_BYTES: usize = 192 << 20;
+    if size == 0 || size > MAX_ASSET_BYTES {
+        info!("TX-ASSET-DIAG: {path} size {size} outside 1..={MAX_ASSET_BYTES} - refusing");
+        return Inner::Failed;
+    }
     let mut out = Vec::with_capacity(size);
-    unsafe { out.set_len(0); }
     let mut chunk = [0u8; 65536];
     let mut got = 0usize;
     while got < size {
@@ -798,11 +935,15 @@ pub fn read_boot_file(path: &str) -> Option<alloc::vec::Vec<u8>> {
         match file.read(&mut chunk[..want]) {
             Ok(0) => { info!("TX-ASSET-DIAG: {path} EOF at {got}/{size}"); break; }
             Ok(n) => { out.extend_from_slice(&chunk[..n]); got += n; }
-            Err(e) => { info!("TX-ASSET-DIAG: {path} read err at {got}/{size}: {:?}", e.status()); return None; }
+            Err(e) => { info!("TX-ASSET-DIAG: {path} read err at {got}/{size}: {:?}", e.status()); return Inner::Failed; }
         }
     }
+    if got != size {
+        info!("TX-ASSET-DIAG: {path} short read {got}/{size} - refusing (damaged stick or pulled media)");
+        return Inner::Failed;
+    }
     info!("TX-ASSET-DIAG: {path} loaded {}/{} bytes", out.len(), size);
-    Some(out)
+    Inner::Content(out)
 }
 
 /// Assets for the transaction, loaded from the boot volume (tx builds
@@ -837,8 +978,7 @@ pub fn validate_asset_sizes(assets: &TxAssets) -> Result<(), TxError> {
     if let Some(v67) = &assets.v67 {
         if v67.len() != tb::V67_SIZE {
             info!(
-                "TX: \\v67-{}-four-plm.bin is {} bytes, want exactly {} (0xfa00) - refusing to run (truncated or damaged stick?)",
-                assets.family,
+                "TX: v67 payload is {} bytes, want exactly {} (0xfa00) - refusing to run (truncated or damaged stick?)",
                 v67.len(),
                 tb::V67_SIZE
             );
@@ -867,7 +1007,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // failure, continue the unwind with a selector probe instead of
     // aborting. Default OFF; see the FORCE-CONTINUE banner at the failure
     // site for what the experiment can and cannot show.
-    let force_continue = read_boot_file("\\tx-force-continue.txt").is_some();
+    let force_continue = probe_file("\\tx-force-continue.txt");
     if force_continue {
         info!("TX: force-continue marker present - booter-stage failures fall through to the selector probe");
     }
@@ -877,7 +1017,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // driver-exact configuration. Gated to 'tu10x' so GA10x/Ada keep the
     // allocation path they were field-verified with. \tx-low-staging.txt
     // reverts even tu10x to the legacy path (A/B testing).
-    let high_staging = assets.family == "tu10x" && read_boot_file("\\tx-low-staging.txt").is_none();
+    let high_staging = assets.family == "tu10x" && !probe_file("\\tx-low-staging.txt");
     crate::pci::set_high_staging(high_staging);
     info!("TX: >4GB staging gate: {high_staging} (family {})", assets.family);
 
@@ -918,6 +1058,22 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // Differential authority map while both engines sit in the as-booted
     // state: localizes the SEC2 start-authority gate before any reset.
     authority_scan(gpu);
+
+    // Issue #17/#62 matrix (Turing, marker-gated, default OFF): two
+    // environment steps the C reference performs and the plain path never
+    // does. \tx-host-probe.txt replays its host probe writes (its own log
+    // proves they change some PLM/SS writable bits - NOT a read-only
+    // diagnostic); \tx-ptimer-seed.txt seeds PTIMER from the RTC (PLM
+    // anti-replay validation needs sane GPU time; the reference omits the
+    // day-of-month field - preserved verbatim, not a precise wall clock).
+    if assets.family == "tu10x" {
+        if read_boot_file("\\tx-host-probe.txt").is_some() {
+            host_probe_reference(gpu);
+        }
+        if read_boot_file("\\tx-ptimer-seed.txt").is_some() {
+            ptimer_seed_reference(gpu);
+        }
+    }
 
     // The kernel AD102 driver runs the SEC2 scrubber before FWSEC, but the
     // community unlock chains (unlock_610.c "GA102 has no scrubber" + every
@@ -1071,7 +1227,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     const OFF_RADIX: u64 = 0x2_0000;
     let mut meta_addr = meta_dma.dev;
     let mut vram_fb = false;
-    if read_boot_file("\\tx-meta-in-vram.txt").is_some() {
+    if probe_file("\\tx-meta-in-vram.txt") {
         // Retarget the radix tables in place: every entry moves by the same
         // delta (tables and leaves are copied as one block).
         let leaves = assets.gsp_image.len().div_ceil(4096);
@@ -1127,7 +1283,15 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // whole image is port-loaded NS+SEC+DMEM with BOOTVEC=0; the GA10x/Ada
     // BootFromHs path loads only the secure segment through BROM params.
     if assets.family == "tu10x" {
-        tb::booter_fire_direct(gpu, &hdr, booter_view, meta_addr)?;
+        if read_boot_file("\\tx-sec2-c-load.txt").is_some() {
+            // Issue #17/#62 matrix: full C-reference fire (no reset, FBIF
+            // CTL bit7 without TRANSCFG rewrite, 3s quiet window). Default
+            // OFF - the field-proven shape above stays the default.
+            info!("TX-tu10x: \\tx-sec2-c-load.txt present - C-reference SEC2 fire (no reset, quiet window)");
+            tb::booter_fire_direct_c(gpu, &hdr, booter_view, meta_addr)?;
+        } else {
+            tb::booter_fire_direct(gpu, &hdr, booter_view, meta_addr)?;
+        }
     } else {
         // Canonical wait split (unlock_610.c falcon_hs): the GA102 V67's
         // tail is the fill self-loop - the booter never halts and writes no
@@ -1186,7 +1350,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
             // as the Code-43 variable. Turing SS0/SS1 live at 0x409664/6c,
             // NOT the GA10x/Ada 0x82381c/820 (cmp50hx lines 294-296).
             let no_ss = assets.family == "tu10x"
-                && crate::tx::read_boot_file("\\tu10x-no-ss.txt").is_some();
+                && crate::tx::probe_file("\\tu10x-no-ss.txt");
             let (ss0_at, ss1_at) = if assets.family == "tu10x" {
                 (tb::TU10X_FEAT_SS0, tb::TU10X_FEAT_SS1)
             } else {
@@ -1239,8 +1403,16 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
         let plm_rb = gpu.pci.bar_read_u32(0, 0x0040_9650 as u64);
         let ss0_rb = gpu.pci.bar_read_u32(0, 0x0040_9664 as u64);
         let ss1_rb = gpu.pci.bar_read_u32(0, 0x0040_966c as u64);
+        // Once the payload opened the block, bits 5:6 resist host clears:
+        // 0xffffffef is the proven handoff end state (TU106 and TU104
+        // identical); a full 0xffffff8f readback would be the surprise.
+        let plm_note = match plm_rb {
+            0xffff_ffef => "known-good (bits 5:6 sticky-open)",
+            0xffff_ff8f => "fully closed",
+            _ => "UNEXPECTED",
+        };
         info!(
-            "TU10X PLM relock: plm={plm_rb:#010x} (want 0xffffff8f) SS0={ss0_rb:#010x} SS1={ss1_rb:#010x} unlock_persist={}",
+            "TU10X PLM relock: plm={plm_rb:#010x} {plm_note} SS0={ss0_rb:#010x} SS1={ss1_rb:#010x} unlock_persist={}",
             ss0_rb == 0x8888_8888 && ss1_rb == 0x8
         );
     }
@@ -1275,6 +1447,10 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
         info!("POST-FLR: verified{}", if flr_expect_unlock { " (selectors survive AON)" } else { "" });
     }
 
+    // Read-only handoff PCI snapshot (issue #61 ask #2): the config state
+    // Windows will inherit, logged before the reconnect touches anything.
+    crate::pci::diag_handoff_pci(gpu.pci);
+
     // Restore the display path before handing off (TOTORONG craft): the
     // FLR-rebooted function re-binds its vendor GOP/driver stack. Non-fatal
     // - bootmgfw self-establishes a console regardless.
@@ -1285,7 +1461,7 @@ pub fn run_transaction(gpu: &TxGpu, assets: &TxAssets, pci_handle: uefi::Handle)
     // the reconnect just restores the boot console earlier (Run A's
     // shape-change when it was removed turned out to be coincidental).
     // A \tu10x-no-reconnect.txt marker skips it again for experiments.
-    if assets.family == "tu10x" && crate::tx::read_boot_file("\\tu10x-no-reconnect.txt").is_some() {
+    if assets.family == "tu10x" && crate::tx::probe_file("\\tu10x-no-reconnect.txt") {
         info!("TX-tu10x: reconnect skipped (tu10x-no-reconnect marker)");
     } else {
         crate::tx_detach::reconnect_all(pci_handle);
@@ -1342,18 +1518,27 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
     // 0x0000 over it, wiping MPS/MRR), wait Transactions Pending clear,
     // set the FLR bit preserving the rest of the register, then 100 ms of
     // NO access at all (PCI spec: the function need not respond).
-    let devctl = pci.config_read_u16(0x78 + 0x08);
+    let pcie = crate::pci::pcie_cap_or_measured(pci);
+    let devcap = pci.config_read_u32(pcie as u32 + 0x04);
+    // PCI_EXP_DEVCAP_FLR = bit 28 (Linux pci_regs.h; gpu-unlock's compat.h
+    // agrees). Bit 15 is the low bit of the L1 Acceptable Latency field
+    // (DEVCAP[17:15]), so testing it warned on every card whose L1 latency
+    // happened to be 0 or 2.
+    if devcap & (1 << 28) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR (bit 28 clear) - the reset below may be a no-op");
+    }
+    let devctl = pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {
-        let devsta = pci.config_read_u16(0x78 + 0x0a);
+        let devsta = pci.config_read_u16(pcie as u32 + 0x0a);
         if devsta == 0xffff || devsta & 0x20 == 0 {
             break;
         }
         boot::stall(core::time::Duration::from_millis(1));
     }
     pci.cfg_write_u16(0x04, 0x0003); // decode on for the restore, BME off
-    pci.cfg_write_u16(0x78 + 0x08, devctl | 0x8000);
+    pci.cfg_write_u16(pcie as u32 + 0x08, devctl | 0x8000);
     boot::stall(core::time::Duration::from_millis(100)); // spec FLR time, silence
-    pci.cfg_write_u16(0x78 + 0x08, devctl); // restore MPS/MRR, clear FLR bit
+    pci.cfg_write_u16(pcie as u32 + 0x08, devctl); // restore MPS/MRR, clear FLR bit
     // Wait for the function to answer config again before touching BARs.
     for _ in 0..1000 {
         let id = pci.config_read_u32(0x00);
@@ -1370,7 +1555,7 @@ pub fn flr_once(pci: &crate::pci::PciIo) {
     }
     pci.cfg_write_u16(0x04, (saved[0] as u16) & !0x0004);
     let cmd = pci.config_read_u16(0x04);
-    let sta = pci.config_read_u16(0x78 + 0x0a);
+    let sta = pci.config_read_u16(pcie as u32 + 0x0a);
     let gfw = pci.bar_read_u32(0, 0x0011_8234);
     let wpr_hi = pci.bar_read_u32(0, 0x001f_a828);
     info!(
@@ -1406,7 +1591,12 @@ pub fn handoff_out(pci: &crate::pci::PciIo) {
     };
     info!(
         "HANDOFF-OUT: ss0={ss0:#010x} ss1={ss1:#x} readout1={readout:#010x} feat_plm={plm:#010x} wpr2_hi={wpr_hi:#x} pmcsr={pmcsr:#06x} dstate=D{dstate} | tu10x: plm={tplm:#010x} ss0={tss0:#010x} ss1={tss1:#010x} | tu10x_unlock={} ss0_unlock={} ss1_unlock={} plm_open={}",
-        tplm == 0xffff_ffff && tss0 == crate::tx_booter::SS0_UNLOCK && tss1 == crate::tx_booter::SS1_UNLOCK,
+        // Relock-aware (issues #12/#14): the shipped tu10x chain closes the
+        // PLM gate after the SS writes (open -> write -> close), so the
+        // success shape is the SS override persisted behind a closed gate -
+        // plm_open is reported separately, and a still-open PLM (0xffffffff)
+        // is covered here too since the SS reads are the same predicate.
+        tss0 == crate::tx_booter::SS0_UNLOCK && tss1 == crate::tx_booter::SS1_UNLOCK,
         ss0 == crate::tx_booter::SS0_UNLOCK,
         ss1 == crate::tx_booter::SS1_UNLOCK,
         plm == 0xffff_ffff,

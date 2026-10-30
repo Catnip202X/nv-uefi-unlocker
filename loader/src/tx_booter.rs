@@ -343,11 +343,15 @@ pub fn wpr_meta_pack(
     // bit-for-bit: heapOffset = 0x1f7900000.
     let (nonwpr_off, nonwpr_size, wpr_start, heap_off, heap_size, flags) = if family == "tu10x" {
         const MB: u64 = 1024 * 1024;
-        let hs = match fb_size {
-            0x280000000 => 0x7F00000, // 10 GiB
-            0x500000000 => 0xFE00000, // 20 GiB
-            _ => 0x6900000,           // 8 GiB (40HX live value)
-        };
+        // TU10x driver formula (RM 615.71.09 source, issue #57): heap =
+        // 8 MiB (BASE_RM) + align_1MiB(96 KiB x GiB) + 96 MiB (CLIENT),
+        // osCarveout = 0 on TU102/TU106. Reproduces every hardware-verified
+        // point: 8G -> 105 MiB (40HX live dump), 22G -> 107 MiB (issue #17 C
+        // reference), 24G -> 107 MiB (TITAN RTX, issue #57). Replaces the
+        // per-size table; the old 10G/20G rows were GA102-sourced and never
+        // applied to a Turing SKU.
+        let gib = (fb_size + ((1 << 30) - 1)) >> 30; // driver: ALIGN_UP64(fbSize, 1GiB) >> 30
+        let hs = (8 * MB) + ((((96 << 10) * gib) + MB - 1) & !(MB - 1)) + (96 * MB);
         let ho = (layout.gsp_offset - hs) & !(MB - 1);
         let ws = ho - MB;
         info!(
@@ -727,6 +731,102 @@ pub fn booter_fire_direct(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: 
     Ok(())
 }
 
+/// Cache flush for the C-reference fire shape (wbinvd before the portal
+/// verifies and again before START, mirroring the proven run).
+fn wbinvd_flush() {
+    // SAFETY: privileged instruction, no memory operands; boot-services
+    // single-threaded context.
+    unsafe { core::arch::asm!("wbinvd", options(nostack, preserves_flags)) };
+}
+
+/// C-reference SEC2 booter fire for Turing BOOT_DIRECT (issue #17/#62
+/// matrix, marker \tx-sec2-c-load.txt). Byte-exact mirror of the
+/// hardware-proven reference path (chenxluo/tu102-22g-uefi-unlock
+/// fire_direct, 2026-10-29, the exact #17 card) in everything it does
+/// DIFFERENTLY from booter_fire_direct, where the load placement itself
+/// (NS@0, SEC@align256(ns), DMEM@0, BOOTVEC=0) is identical and kept:
+/// 1. no engine reset - entry must already be halted (checked, never
+///    assumed); the reference never resets SEC2;
+/// 2. FBIF CTL bit7 (ALLOW_PHYS_NO_CTX) preserve-set + DMACTL=0 WITHOUT
+///    touching TRANSCFG (the default path additionally forces
+///    TRANSCFG0=(x&!7)|5; the reference leaves the as-POSTed aperture);
+/// 3. a fully QUIET 3s window after START - the default path samples
+///    DMEM/mailboxes mid-run through the same portal registers; the
+///    reference performs zero MMIO until the halt poll;
+/// 4. direct CPUCTL=2 START with no alias-retry branch, plus the
+///    reference's pre-START portal verify readbacks.
+pub fn booter_fire_direct_c(gpu: &TxGpu, hdr: &BooterHdr, image: &[u8], meta_dma: u64) -> Result<(), TxError> {
+    let base = crate::tx::eng::SEC2;
+    // Entry precondition (reference fire_direct): SEC2 halted and readable.
+    // No reset is performed - if the PRI window is closed or the core runs,
+    // this variant refuses instead of "fixing" the state.
+    let cpuctl = gpu.pci.bar_read_u32(gpu.bar, (base + 0x100) as u64);
+    if cpuctl == !0u32 || cpuctl & 0xffff_0000 == 0xbadf_0000 || cpuctl & (1 << 4) == 0 {
+        info!(
+            "BOOTER-C: entry precondition failed (CPUCTL={cpuctl:#010x}, want halted+readable) - refusing (the reference path never resets)"
+        );
+        return Err(TxError::EIO);
+    }
+    info!("BOOTER-C: entry halted ok (CPUCTL={cpuctl:#010x}) - no reset, as-POSTed state kept");
+    // Reference preamble: FBIF CTL bit7 preserve-set, DMACTL = 0. TRANSCFG
+    // stays exactly as the POST/BSI handoff left it.
+    let ctl = gpu.read32(base + 0x624)?;
+    gpu.write32(base + 0x624, ctl | (1 << 7));
+    gpu.write32(base + 0x10c, 0);
+    info!("BOOTER-C: FBIF CTL {ctl:#010x} -> {:#010x} (bit7), DMACTL=0, TRANSCFG untouched", ctl | (1 << 7));
+    // Portal loads - identical placement to booter_fire_direct.
+    let ns = &image[hdr.imem_ns_off as usize..(hdr.imem_ns_off + hdr.imem_ns_size) as usize];
+    crate::tx_portal::portal_load_imem(gpu, base, 0, hdr.imem_ns_off, ns, false);
+    let sec_dest = hdr.imem_ns_size.div_ceil(256) * 256;
+    let sec = &image[hdr.app_code_off as usize..(hdr.app_code_off + hdr.app_code_size) as usize];
+    crate::tx_portal::portal_load_imem(gpu, base, sec_dest, hdr.app_code_off, sec, true);
+    let dmem = &image[hdr.data_off as usize..(hdr.data_off + hdr.data_size) as usize];
+    crate::tx_portal::portal_load_dmem(gpu, base, 0, dmem);
+    wbinvd_flush();
+    // Reference verify readbacks BEFORE start (imem word0, dmem 0x200).
+    gpu.write32(base + 0x180, 0);
+    let imem_rb = gpu.read32(base + 0x184)?;
+    let ns_word0 = u32::from_le_bytes(ns[..4].try_into().unwrap());
+    if imem_rb != ns_word0 {
+        info!("BOOTER-C: imem verify mismatch: {imem_rb:#010x} != {ns_word0:#010x}");
+        return Err(TxError::EIO);
+    }
+    gpu.write32(base + 0x1c0, 0x200);
+    let dmem_rb = gpu.read32(base + 0x1c4)?;
+    gpu.write32(base + 0x1c0, 0);
+    if dmem.len() >= 0x204 {
+        let dmem_word = u32::from_le_bytes(dmem[0x200..0x204].try_into().unwrap());
+        if dmem_rb != dmem_word {
+            info!("BOOTER-C: dmem verify mismatch: {dmem_rb:#010x} != {dmem_word:#010x}");
+            return Err(TxError::EIO);
+        }
+    }
+    info!("BOOTER-C: portal verify ok (imem {imem_rb:#010x} dmem {dmem_rb:#010x})");
+    // BOOTVEC = 0, mailboxes = meta, direct START (the reference writes
+    // CPUCTL=2 unconditionally; the alias retry lives in the default path).
+    gpu.write32(base + 0x104, 0);
+    gpu.write32(base + 0x040, meta_dma as u32);
+    gpu.write32(base + 0x044, (meta_dma >> 32) as u32);
+    wbinvd_flush();
+    info!(
+        "BOOTER-C: fire meta dev={meta_dma:#x} mbox0={:#010x} mbox1={:#010x} BOOTVEC=0 START (quiet window next - no MMIO for 3s)",
+        meta_dma as u32,
+        meta_dma >> 32
+    );
+    gpu.write32(base + 0x100, 2);
+    // QUIET window: 3s of zero MMIO (the reference's exact shape), then the
+    // bounded halt poll, then a 1s settle. NO mid-run portal sampling.
+    uefi::boot::stall(core::time::Duration::from_micros(3_000_000));
+    gpu.poll_us(base + 0x100, 1 << 4, 1 << 4, 2_000_000, true)?;
+    uefi::boot::stall(core::time::Duration::from_micros(1_000_000));
+    let cpu_end = gpu.read32(base + 0x100)?;
+    let mbox0 = gpu.read32(base + 0x040)?;
+    let mbox1 = gpu.read32(base + 0x044)?;
+    let exci = gpu.read32(base + 0x0d0)?;
+    info!("BOOTER-C: post-quiet CPUCTL={cpu_end:#010x} mailbox0={mbox0:#x} mailbox1={mbox1:#x} exci={exci:#010x} (verdict lands in POST-BOOT)");
+    Ok(())
+}
+
 /// Booter status codes 0x89-0x90 belong to `wpr_desc_validate` (cmp170hx
 /// falcon-and-booter status table; 0x8e/0x8f are that function's later
 /// 0x1ffff-alignment and 0xfff-field checks): the WprMeta the booter
@@ -928,19 +1028,30 @@ pub fn flr_phase(gpu: &TxGpu, family: &str, payload_mode: bool) -> Result<(), Tx
         info!("FLR: BME stuck");
         return Err(TxError::EIO);
     }
-    let devctl = gpu.pci.config_read_u16(0x78 + 0x08);
+    // PCIe capability by walk (Device Control at +0x08), not by the measured
+    // 0x78 constant: a wrong offset would write the FLR bit into an unrelated
+    // dword and the reset would silently never happen.
+    let pcie = crate::pci::pcie_cap_or_measured(gpu.pci);
+    let devcap = gpu.pci.config_read_u32(pcie as u32 + 0x04);
+    // PCI_EXP_DEVCAP_FLR = bit 28, not 15: bit 15 is the low bit of the L1
+    // Acceptable Latency field, so the old test warned on cards with L1
+    // latency 0 or 2 regardless of their FLR support.
+    if devcap & (1 << 28) == 0 {
+        info!("FLR: DEVCAP={devcap:#010x} does not advertise FLR (bit 28 clear) - continuing (the reset may be a no-op, and a payload verdict must not be lost to it)");
+    }
+    let devctl = gpu.pci.config_read_u16(pcie as u32 + 0x08);
     for _ in 0..1000 {
-        let devsta = gpu.pci.config_read_u16(0x78 + 0x0a);
+        let devsta = gpu.pci.config_read_u16(pcie as u32 + 0x0a);
         if devsta == 0xffff || devsta & 0x20 == 0 {
             break;
         }
         uefi::boot::stall(core::time::Duration::from_millis(1));
     }
-    // PCIe cap at 0x78: Device Control at +0x08; FLR bit 15.
-    gpu.pci.cfg_write_u16(0x78 + 0x08, devctl | 0x8000);
+    // FLR bit 15 of Device Control at the walked offset.
+    gpu.pci.cfg_write_u16(pcie as u32 + 0x08, devctl | 0x8000);
     info!("PCIe FLR triggered");
     uefi::boot::stall(core::time::Duration::from_millis(100)); // no access of any kind to the function
-    gpu.pci.cfg_write_u16(0x78 + 0x08, devctl);
+    gpu.pci.cfg_write_u16(pcie as u32 + 0x08, devctl);
     // Wait for config to answer before any BAR access (TOTORONG GuFlr tail).
     for _ in 0..1000 {
         let id = gpu.pci.config_read_u32(0x00);

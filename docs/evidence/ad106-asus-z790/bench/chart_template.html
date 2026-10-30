@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>4060 Ti Unlock Benchmark</title>
+<style>
+  :root {
+    --surface: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e86;
+    --grid: #2e2e2c;
+    --axis: #4a4a46;
+  }
+  html, body { margin: 0; background: var(--surface); }
+  body { width: 1600px; height: 900px; font-family: "Segoe UI", Inter, system-ui, sans-serif; color: var(--text-primary); }
+  .wrap { padding: 56px 72px 40px; box-sizing: border-box; height: 100%; display: flex; flex-direction: column; }
+  h1 { font-size: 44px; font-weight: 650; margin: 0; letter-spacing: -0.5px; }
+  .sub { font-size: 22px; color: var(--text-secondary); margin-top: 10px; }
+  .legend { display: flex; gap: 36px; margin-top: 28px; font-size: 21px; color: var(--text-secondary); }
+  .legend span { display: inline-flex; align-items: center; gap: 10px; }
+  .sw { width: 18px; height: 18px; border-radius: 4px; display: inline-block; }
+  svg { margin-top: 12px; flex: 1; }
+  .foot { font-size: 16px; color: var(--text-muted); display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RTX 4060 Ti 8 GB — tensor throughput, unlocked on Windows</h1>
+  <div class="sub">cuBLAS GEMM, FP32 accumulate · same card, driver and power/clock profile · TFLOPS (higher is better)</div>
+  <div class="legend" id="legend"></div>
+  <svg id="c" viewBox="0 0 1456 600" width="1456" height="600" role="img" aria-label="Grouped bar chart of TFLOPS, stock versus unlocked"></svg>
+  <div class="foot">
+    <span>ASUS ROG MAXIMUS Z790 APEX · i9-14900K · 216 W limit + Afterburner curve · __FOOT__</span>
+    <span>FP32 is the control: unchanged by design</span>
+  </div>
+</div>
+<script>
+  const groups = __GROUPS__;
+  const names = __NAMES__;
+  const colors = __COLORS__;
+  const legend = document.getElementById("legend");
+  names.forEach((n, j) => {
+    const s = document.createElement("span");
+    s.innerHTML = `<i class="sw" style="background:${colors[j]}"></i>`;
+    s.append(n);
+    legend.append(s);
+  });
+  const W = 1456, H = 600, L = 64, R = 8, T = 40, B = 64;
+  const peak = Math.max(...groups.flatMap(g => g.v));
+  const step = peak > 120 ? 40 : 20;
+  const max = Math.ceil(peak * 1.12 / step) * step;
+  const ticks = Array.from({ length: max / step + 1 }, (_, i) => i * step);
+  const y = v => T + (H - T - B) * (1 - v / max);
+  const svg = document.getElementById("c");
+  const ns = "http://www.w3.org/2000/svg";
+  const el = (tag, attrs, text) => {
+    const e = document.createElementNS(ns, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    svg.appendChild(e);
+    return e;
+  };
+  for (const t of ticks) {
+    el("line", { x1: L, x2: W - R, y1: y(t), y2: y(t), stroke: t === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 });
+    el("text", { x: L - 14, y: y(t) + 6, "text-anchor": "end", fill: "var(--text-muted)", "font-size": 18 }, t);
+  }
+  const k = names.length, gw = (W - L - R) / groups.length, bw = k === 2 ? 110 : 78, gap = 2;
+  groups.forEach((g, i) => {
+    const cx = L + gw * i + gw / 2;
+    const x0 = cx - (bw * k + gap * (k - 1)) / 2;
+    g.v.forEach((v, j) => {
+      const x = x0 + j * (bw + gap), top = y(v), r = 4;
+      el("path", {
+        d: `M${x},${y(0)} V${top + r} Q${x},${top} ${x + r},${top} H${x + bw - r} Q${x + bw},${top} ${x + bw},${top + r} V${y(0)} Z`,
+        fill: colors[j],
+      });
+      el("text", { x: x + bw / 2, y: top - 10, "text-anchor": "middle", fill: "var(--text-secondary)", "font-size": 18 }, v.toFixed(1));
+    });
+    const gain = Math.round((g.v[k - 1] / g.v[0] - 1) * 100);
+    const label = /control/.test(g.name) ? "≈ unchanged" : `+${gain}%`;
+    el("text", { x: cx, y: y(Math.max(...g.v)) - 44, "text-anchor": "middle", fill: "var(--text-primary)", "font-size": 30, "font-weight": 650 }, label);
+    el("text", { x: cx, y: y(0) + 38, "text-anchor": "middle", fill: "var(--text-secondary)", "font-size": 21 }, g.name);
+  });
+</script>
+</body>
+</html>

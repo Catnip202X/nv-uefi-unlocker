@@ -219,15 +219,20 @@ GSP_GATE_STATUS="n/a"
 ADAPTER_LINES=""
 
 gsp_state() { # echoes: active | inactive | unknown | failed  (nvidia-smi must exist)
-    local q any_field=0 any_active=0 line val
+    local q any_field=0 any_inactive=0 line val
     q="$(nvidia-smi -q 2>/dev/null)" || { echo "failed"; return; }
     while IFS= read -r line; do
         any_field=1
         val="${line#*:}"; val="${val//[[:space:]]/}"
-        case "${val,,}" in n/a|na|"") ;; *) any_active=1 ;; esac
+        # FAIL CLOSED. This aggregate cannot tell WHICH adapter the field
+        # belongs to, so a single N/A has to count against the build: a Turing
+        # card left on the legacy init path TDR-loops on the unlocked GPU, and
+        # the old any_active rule let a 4090 + 2070 box pass on the 4090's GSP
+        # state. Building for another machine? --skip-gsp-check.
+        case "${val,,}" in n/a|na|"") any_inactive=1 ;; esac
     done < <(printf '%s\n' "$q" | grep 'GSP Firmware Version' || true)
     if [ "$any_field" -eq 0 ]; then echo "unknown"; return; fi
-    [ "$any_active" -eq 1 ] && echo "active" || echo "inactive"
+    [ "$any_inactive" -eq 1 ] && echo "inactive" || echo "active"
 }
 
 check_turing_gate() {
@@ -248,10 +253,13 @@ check_turing_gate() {
             dv=0
             if [ "${#d}" -eq 4 ]; then dv=$((16#$d)) || dv=0; fi
             is_turing=0
-            # Same ranges as the PowerShell twin's Test-TuringDevId:
+            # Same ranges as the PowerShell twin's Test-TuringDevId and
+            # tools/windows/enable-turing-unlock.ps1:
             # 0x1E02..0x1FFF (TU102/TU104/TU106/TU116, incl. 16-series) and
-            # 0x2182..0x2192 (mobile TU117 etc.).
-            if (( dv >= 0x1E02 && dv <= 0x1FFF )) || (( dv >= 0x2182 && dv <= 0x2192 )); then
+            # 0x2182..0x21D1 (mobile TU117 and the 21xx variants - the upper
+            # bound used to stop at 0x2192 here, so 0x2193..0x21D1 cards were
+            # "no Turing adapter" on Linux and "refused" on Windows).
+            if (( dv >= 0x1E02 && dv <= 0x1FFF )) || (( dv >= 0x2182 && dv <= 0x21D1 )); then
                 is_turing=1
                 log "  Turing adapter ${_idx// /}: ${gname:-?} (0x$d) on this host"
                 break

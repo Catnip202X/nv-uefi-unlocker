@@ -1,30 +1,54 @@
 # nv-uefi-unlocker
 
+[Project trailer (Bilibili, Simplified Chinese)](https://www.bilibili.com/video/BV1d6xN66ECM/)
+
+[How-it-works explainer, power-user edition (Bilibili, Simplified Chinese)](https://www.bilibili.com/opus/1264436370549506065)
+
+[How-it-works explainer, beginner edition (Bilibili, Simplified Chinese)](https://www.bilibili.com/opus/1264493051219279872)
+
 [中文](README.md) | [English](README.en.md)
 
-A UEFI pre-driver NVIDIA GPU unlocker (Windows, Rust). In the UEFI DXE
+A UEFI pre-driver NVIDIA GPU unlocker for the RTX 20–40 series, usable on
+every OS (developed on Windows, in Rust). In the UEFI DXE
 window **before** the NVIDIA driver loads, it performs the complete
 firmware transaction: SEC2 scrubber → FWSEC-FRTS (WPR2) → signed Booter
 booting GSP-RM → (gated) V67 four-write payload → read-back verification
 → FLR → chained handoff back to the Windows Boot Manager.
 
-**Current status: both the 40-series (AD10x) and 20-series (TU10x) tracks
-are closed end to end.** Support matrix:
+**Current status: three tracks closed end to end — 40-series (AD10x),
+30-series (GA10x) and 20-series (TU10x); the 30 series is fully
+compatible as of v2.1.0.** Support matrix:
 
-- **RTX 20 series (Turing) ✅ verified (v0.2.0)** — RTX 2070 (TU106,
+- **RTX 20 series (Turing) ✅ fully compatible, field-verified
+  (v0.2.0)** — RTX 2070 (TU106,
   `10de:1f07`) full-chain unlock: **FP32-accum GEMM 36 → 60-63 TFLOPS
   (+67-75%)**; 2060 Super (`10de:1f06`) community-verified on the same
   chain ([issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12)).
   **Turing users must first run the [GSP firmware-mode
   script](#turing-20-series-prerequisite-gsp-firmware-mode-must-read) and
   RESTART** — see the Turing section below.
-- **RTX 40 series (Ada) ✅ verified** — RTX 4060 Laptop (`10de:28e0`,
+- **RTX 30 series (Ampere/GA10x) ✅ fully compatible (v2.1.0)** — since
+  2026-10-28 the GA10x device-ID ranges (0x22xx/0x24xx/0x25xx) are fully
+  routed: **the 30 series is fully compatible**. Evidence: RTX 3060 Ti
+  LHR (GA104, `10de:2489`) unlocked with v2.1.0 ([issue
+  #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11):
+  wait_plm verdict, PLM flip + SS0/SS1 read-backs all correct; passed on
+  an AMD platform with a flashed cross-vendor VBIOS); the same chain is
+  upstream-verified across the family (3060 / 2487, +58-85% with
+  community tools). **30-series users do NOT need** the Turing
+  GSP firmware-mode prerequisite.
+  Additional EFI reports cover 3080 (`2206`), 3070 Laptop (`249d`) and 3080 Ti Laptop (`2420`); see [community reports](docs/community-reports.md).
+- **RTX 40 series (Ada) ✅ fully compatible, field-verified** — RTX
+  4060 Laptop (`10de:28e0`,
   AD107M) four-write unlock, verified on both sides: firmware marker
   `0x67b00001` + the four PLM read-backs; Windows-side FP16 GEMM 29.89 →
   49.33 TFLOPS (1.65×). Full report:
   [docs/ada28e0-uefi-report.md](docs/ada28e0-uefi-report.md).
 
-The mechanical differences between the two generations are in the
+- **RTX 16 series (Turing): theoretically compatible — field tests
+  welcome**
+
+The mechanical differences between the three generations are in the
 [compatibility matrix](#compatibility-matrix) (Turing's FEAT block lives
 at 0x4096xx, FLR re-locks the PLMs, and the Windows driver requires GSP
 mode — all different from Ada).
@@ -35,7 +59,7 @@ mode — all different from Ada).
 
 | File | Purpose | Required |
 | --- | --- | --- |
-| `BOOTX64.EFI` | This tool (back up any existing file of that name first) | ✅ |
+| `\EFI\BOOT\BOOTX64.EFI` | This tool (back up any existing file at this path first) | ✅ |
 | `booter_load_ad102.bin` | AD102-family Booter bundle (BTL1) | ✅ |
 | `gsp_boot_ad102.bin` + `gsp_boot_desc_ad102.bin` | GSP-RM boot segment + v5 descriptor | ✅ |
 | `fwimage_ad102.bin` | GSP-RM firmware image (~80 MiB, radix3-loaded) | ✅ |
@@ -46,15 +70,16 @@ mode — all different from Ada).
 | `tx-select-bdf.txt` | Multi-GPU card pin: contents `bb:dd.f` or `dddd:bb:dd.f` (hex) | optional |
 | `i_know_what_i_am_doing.txt` | **Armed mode**: the confirm phase becomes a 5-second countdown that then runs automatically; any key during the countdown aborts (for unattended/automated use; the file's existence is the declaration of intent, its content is ignored) | optional |
 | `chain-target.txt` | Chain-target pin: the first non-empty, non-`#` line = an EFI path tried first (e.g. `\EFI\limine\limine_x64.efi`), on every volume; if no volume has it, the tool falls back to the default order with a loud log line (issue #8 suggestion) | optional |
+| `no-reconnect.txt` | Skip the post-transaction GOP/console reconnect on the target card: the reconnect only restores the display earlier (bootmgfw self-establishes its own console), and a few AMI firmwares hang or reset the platform inside it (see the known issue below) — if the log stops at `RECONNECT: ConnectController ... begin`, put this file in the stick root and re-run | optional |
 | `\loader.log` | (output) full stage log, the evidence record | output |
 
+The table uses the Ada asset names; choose `ga102` for GA10x or `tu10x` for Turing in the maker. Put `BOOTX64.EFI` at `\EFI\BOOT\BOOTX64.EFI`; put the selected family's `.bin` files and optional marker files at the stick root. The current maker emits a flat output directory, including intermediate extraction files: copy the family's files listed by its final `expected` list, and create `EFI/BOOT/` for the executable. Do not copy every intermediate firmware image.
+
 Without `v67-*.bin` the tool runs in **replay/diagnostic mode**: the full
-chain with zero unlock writes (a safe/forensic existence proof). The log
+chain without the unlock payload. It still detaches drivers, starts signed firmware and may reset the GPU; replay is a write transaction, not the read-only `cargo efi` build. The log
 line `family 'xxx' transaction track not enabled` means that chip family
 has no transaction track yet (all three of 20/30/40 are wired now; a card
-with missing assets is skipped). For a first run on a card not yet in the
-matrix, replay mode first: reaching `TX: execution verified` means the
-whole path works — add the payload afterwards.
+with missing assets is skipped).
 
 **Multi-GPU**: with several supported cards in the machine, the default is
 to process **every one of them in firmware enumeration order** — a card
@@ -72,8 +97,9 @@ other card silently takes its place).
    measured table below — **dGPU-only (MUX) is recommended**; hybrid mode
    works only in the single entry path "restart, with the dGPU powered"
    (see the analysis for why).
-2. Boot from the stick → version banner → **press Space to confirm**
-   (30 s with no key automatically returns to Windows). If
+2. Boot from the stick → version banner → **press Space or Enter to
+   confirm** (any other key aborts; 30 s with no input automatically
+   returns to Windows). If
    `i_know_what_i_am_doing.txt` exists in the stick root (armed mode),
    the confirm phase becomes a **5-second countdown that then runs
    automatically**; any key during the countdown aborts. The file itself
@@ -254,6 +280,30 @@ essence). **The supported environment is native PCIe slots / dGPU-direct
 laptops.** TB / hot-plug-root-port users: treat "no gain after entering
 the OS" as expected behavior — no need to file an issue.
 
+**TB field-test call (2026-10-29)**: `tools/ssdiag` turns this scenario
+into a cheap experiment — please run it and report the data (Discussions
+or a new issue, full output attached):
+
+1. Unlock via the stick → in Windows, run `ssdiag` for the verdict.
+   **Gate open + stock values** (SS0/SS1 not 0x88888888/0x8) → the values
+   were re-derived; `ssdiag --reapply` can write them back without a
+   reboot. **Gate closed** (reads come back badf) → the tunnel rebuild
+   performed a real reset; only the USB stick helps, and a reapply is
+   meaningless in that state.
+2. On a "gate open" verdict, run `ssdiag --reapply` and measure the same
+   GEMM load before/after (cuBLAS/GPU-Z both fine).
+3. Paste both `ssdiag` outputs and the throughput pair. Success or
+   failure, every report is a data point: for the first time this
+   distinguishes "the tunnel rebuild only re-derived the values" from
+   "it performed a real reset" — exactly what we could not tell before,
+   which is why the whole scenario was filed as a blanket known
+   limitation.
+
+Boundaries unchanged: after dock sleep / power cut (D3cold) a reapply is
+meaningless (the card lost power; re-powering goes through PERST# and
+re-erases); a pure link retrain (below) does not touch the unlock and
+needs no reapply.
+
 One PCIe-semantics clarification worth keeping: **a pure link retrain
 (Retrain Link / a TLS change / the LTSSM re-run triggered by ASPM config)
 does not reset the endpoint** — device registers and config space are
@@ -354,8 +404,7 @@ clock.
 > delivery or the machine caused by over-power, over-voltage or
 > over-temperature** — the unlock is volatile, but a fried die does not
 > recover.
-
-<img width="287" height="520" alt="image" src="https://github.com/user-attachments/assets/d5e5fb50-4504-4b76-ba43-56e5db078b8b" />
+> <img width="287" height="520" alt="image" src="https://github.com/user-attachments/assets/d5e5fb50-4504-4b76-ba43-56e5db078b8b" />
 
 ## How it works (overview)
 
@@ -387,7 +436,7 @@ persists, nothing is flashed, everything clears on power loss. Details:
 Judgement basis: this tool routes by **chip family** (all IDs of a family
 share the same Booter/payload assets, matching the upstream
 `ad102_family()`/GA10x routing). Tier meanings: ✅ verified here (full
-chain + payload on real silicon); 🟢 upstream silicon-verified (same
+chain + payload on real silicon, including attributed community reports); 🟢 upstream silicon-verified (same
 family proven on the kmod side, our EFI path is structurally identical —
 expected compatible); 🟡 path exists, unverified (code ready, no silicon
 evidence); ❌ incompatible.
@@ -406,17 +455,22 @@ Blackwell (0x2bxx+) is out of scope.
 | Family | Cards (device IDs) | Tier |
 | --- | --- | --- |
 | AD107 | 4060 Laptop **28e0** | ✅ verified (this report) |
-| AD107 | 4060 2882 / 4060 Laptop 28a0 / 4050M 28e1 | 🟢 upstream silicon-verified (28e1 has a 2.00× measured report) |
+| AD107 | 4060 2882 / 4060 Laptop 28a0 / 4050M 28e1 | **28a0 ✅ verified** ([issue #50](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/50), 2026-10-29, v2.1.4, MECHREVO Aurora 15, dGPU-direct 140 W): full chain passed in a single run (WPR2 verified → marker → four writes → signature restore → AON survival after FLR); FP16 8192 **26.37→50.29 TFLOPS (×1.91)**, power pinned at the TGP ceiling while the clock *dropped* 1.5% — the TGP-bottleneck fingerprint; the Intel RPL root-port bridge BME fix (PR #5) exercised in the field. The rest (2882/28e1) keep the upstream evidence tier |
 | AD107 | 4050 Laptop **28a1** | ✅ verified (2026-10-26, v0.1.3): full chain on silicon (WPR2 verified → booter marker → four writes → selectors → signature restore → AON survival after FLR); FP16 tensor **22 → 38-42 TFLOPS (1.7-1.9×)**, integrity self-tests green; the gated `0xbadf1301` goes through the fallback |
-| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ verified** (PR #5, AD106 desktop: replay + unlock + four writes read back, FP16 46.78→75.28 TFLOPS); 2805 🟢 upstream silicon-verified |
+| AD106 | 4060Ti 2803 / 4060Ti 16G 2805 | **2803 ✅ verified** (PR #5, AD106 desktop: replay + unlock + four-write read-backs, FP16 46.78→75.28 TFLOPS); **2805 ✅ verified** ([report](docs/evidence/ad106-2805-nuc13/report.md): ASUS `1043:8921` + Intel NUC13RNGi9, full-chain read-backs, FP16 45.78→75.24 TFLOPS, ComfyUI dense bf16 ×1.57). **Further 2803 platform reports**: [issue #51](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/51) (AMD APU desktop, v0.2.0, FP16 45.96→75.40, BF16 44.61→78.72 — reproduces the PR #5 result); [issue #33](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/33) (MSI B550, single card with no iGPU, v2.1.4, sustained-full-load method FP16 45.72→67.30, ComfyUI ×1.51; includes a [boot-time auto-unlock setup without the USB stick](https://github.com/chungtair/rtx4060ti-auto-unlock) and the MSI B550 quirk of having to add the boot entry in BIOS by hand); [issue #56](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/56) (dual-GPU with an RTX 5060 Ti `2d04`: the Blackwell primary card is safely skipped = a negative-control data point; the secondary card FP16 44.94→71.81, stable for 24 h+) |
 | AD106 | 4070 Laptop **2820** (same ID on modded cards) | 🟡 routed (2026-10-28): shares the AD106 family assets, same die family as 2803 (upstream's table lacks this ID too). First silicon run: post the full `\loader.log` per "When it does not work / misbehaves" below; the tier moves up only after that. **Modded cards: also include the original card model and VBIOS version** |
-| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | 🟢 upstream silicon-verified |
-| AD103 | 4080S 2702 / 4080 2704 / 4070TiS 2705 / **4070 2709** / 4090M 2757 | **2709 ✅ verified** ([issue #8](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/8), B760 desktop dGPU-only: full four-write chain read back, selectors surviving FLR; OS-side sm_89 mma microbenchmark FP16 ~61→**123.91**, BF16 **118.90**, FP8 **243.55** TFLOPS — all **2.0×**); the rest 🟢 upstream silicon-verified |
-| AD102 | 4090 2684 / 4090D 2685 / 4070TiS 2689 | 🟢 upstream silicon-verified |
-| GA10x | 3090/3080 2204/2206, 3070s 2484–248c, 3060s 2501–2584 etc. (0x22xx/0x24xx/0x25xx fully open since 2026-10-28; the former 20c2/20f1 are GA100-class and have been removed) | 🟡 kmod-verified upstream; our EFI path has no silicon evidence |
+| AD104 | 4070Ti 2782 / 4070S 2783 / 4070 2786 | **2783 ✅ community-verified** ([issue #3](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/3), v0.1.4, Palit RTX 4070 SUPER + MSI B760 TOMAHAWK WIFI, 220 W): replay/unlock read-backs and FLR survival; 8192 GEMM FP16 70.5→100.1, BF16 71.0→107.0 TFLOPS. Other listed IDs retain upstream evidence |
+| AD103 | 4080S 2702 / 4080 2704 / 4070TiS 2705 / **4070 2709** / 4090M 2757 | **2709 ✅ verified** ([issue #8](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/8), B760 desktop dGPU-only: full four-write chain read back, selectors surviving FLR; OS-side sm_89 mma microbenchmark FP16 ~61→**123.91**, BF16 **118.90**, FP8 **243.55** TFLOPS — all **2.0×**); **2705 ✅ verified** ([issue #36](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/36), v2.1.0, AMD `1022:14db` bridge, dGPU-direct: full four-write chain read back with the pre-transaction replay equally green; sm_89 issue-rate microbenchmark 61.98→**125.29 TFLOPS (2.02×)**, power wall untouched, 143.5 W / 50.9 °C); **2704 ✅ verified** ([issue #53](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/53), v2.1.0, retail 16 GB card on Windows 11 24H2: passed in one cold-boot run; PyTorch FP32-accum A/B FP16 4096³ 100.53→185.50 (1.85×), BF16 4096³ 1.91×, strict FP32 control unchanged); the rest (2702/2757) 🟢 upstream silicon-verified |
+| AD102 | 4090 2684 / 4090D 2685 / 4070TiS **2689** | **2689 ✅ verified** (Bilibili comment-section feedback, added 2026-10-30; driver-side `VERDICT [ada]: UNLOCKED` confirmed — PLM=0xffffffff, SS0=0x88888888, SS1=0x8, READOUT_1=0x00000000, the four writes still effective after the driver loads): FP16 4096 57.00→150.93 (**2.65×**), BF16 4096 57.51→127.32 (2.21×), FP16 8192 55.50→127.28 (2.29×), BF16 8192 54.97→128.39 (2.34×); power 227→291.58 W (295 W cap), 59 °C, `throttle_reasons=0x4` — the bottleneck has moved from the issue rate to the power wall; the multipliers match the measured AD103/AD106 results, as expected from the upstream silicon verification. The rest (2684/2685) 🟢 upstream silicon-verified |
+| GA102 | 3090 2204 / **3080 2206** / **3080 LHR 2216** / 3080 Ti 2208 / 3070 Ti 2205 etc. (whole 0x22xx range routed) | **2206 ✅ verified** ([issue #29](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/29), v2.1.0, MSI MEG Z490 UNIFY, single card dGPU-direct 340 W, Windows 10): WPR2 / PLM flip / selectors / signature restore / FLR read-backs pass; FP16 4096 48.36→104.55, 8192 63.96→99.67 TFLOPS, gains capped by the power wall ([details](docs/community-reports.md)). **2216 ✅ verified** ([issue #15](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/15), B550 with no iGPU, single display: FP16 8192 57.72→94.0–96.9 (+63–68%), BF16 +74–79%, TF32 +52–67%, ComfyUI SDXL +28.8%; per-SM rates in the same band as a 3090 Ti reference card; two GA10x false-negative-verdict fixes came out of it). Other GA102 same-family cards keep the fully-routed verdict |
+| GA103M | 3080 Ti Laptop **2420** | **2420 ✅ verified** ([issue #27](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/27), v2.1.0, MSI Vector GP76, dGPU-direct 175 W: PLM flip, selector read-backs and FLR survival; FP16 49.23→77.80/80.35, BF16 50.35→77.64/80.84, FP32 unchanged; [results and caveats](docs/community-reports.md)) |
+| GA104 | 3070 2484–248c / 3060 Ti **2489** etc. (whole 0x24xx range routed) | **2489 ✅ verified** ([issue #11](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/11), 2026-10-28, v2.1.0, @hunan-NRT, B450M Mortar + 5700X3D): wait_plm verdict passed (PLM flip 0xffffff8f→0xffffffff read back, ~149 ms; SS0/SS1 written and read back 0x88888888/0x8, FEAT_READOUT_1=0) → clean Windows handoff; the card runs a flashed Inno3D iChill 3060 Ti VBIOS (cross-VBIOS is fine, FWSEC PROM reads normally). **2484 ✅ EFI-verified** ([issue #54](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/54), Thunderbolt 3 eGPU, local v0.2.0 build: full UEFI chain passed, selectors alive after FLR, but **the state does not survive into Windows** (the Linux `host_reset=N` path preserves it; the same machine's v2.1.5 transaction failure was not reproduced) — see the Thunderbolt-dock known limitation below). Other GA104 cards keep the fully-routed verdict |
+| GA104M | 3070 Laptop **249d** | **249d ✅ verified** ([issue #28](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/28), v2.1.0, AMD Cezanne MUX dGPU-direct 140 W: PLM flip ~158 ms; SS0/SS1, signature restore, FLR and HANDOFF-OUT read-backs correct; FP16 8192 35.43→56.04, 4096 37.82→60.96). Mixed-output machines have an anomaly record ([#28 caveats](docs/community-reports.md), another 249d in issue #6) — see "When it does not work / misbehaves" |
+| GA106 (incl. M) | 3060 2501–2508 / 3060 Laptop 2560 etc. (whole 0x25xx range routed) | 🟢 upstream silicon-verified (same-family ga102 assets). First `2560` case: [issue #6](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6) — the four writes had landed in the PLM but the old HALT/marker verdict misjudged the run as failed ([verdict-fix trace](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/6)); the selectors were not written, so it does not count as a success; a retest on that machine is pending |
+| GA107 | 3050 2507 / 3050 Laptop 25a2 etc. | 🟡 path exists, unverified. [issue #37](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/37) (25A2 4 GB) was a wait_plm entry race (the payload flipped the gate before the entry read), fix traced in that issue |
 | **TU106** | **RTX 2070 1f07 / 2060 Super 1f06** | **1f07 ✅ verified** (2026-10-27, v0.2.0): full chain (FWSEC ignite → BOOT_DIRECT booter → V67 fire → PLM 0x409650 fully open → SS0/SS1 written+read back → signature restore); **FP32-accum 36 → 60-63 TFLOPS (+67-75%)**. **Prerequisite: Windows-side GSP firmware mode (section below), RESTART to apply**. Measured host: Intel 10980HK ES (QTJ1) + 2070 hybrid-output desktop platform; **hibernate-resume → stick unlock write → Windows verification passed**. **1f06 ✅ verified** ([issue #12](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/12), 2026-10-27, v0.2.0, @vadash): full chain (FWSEC → WPR2 verified → BOOT_DIRECT booter → PLM fully open → SS0/SS1 written+read back 0x88888888/0x8 → signature restore → unlock values persist through the PLM relock → FLR skipped per semantics) → clean Windows handoff; **AMD platform** (AM4/Promontory, the bridge-BME fix path exercised); 8 GB SKU shares the 8192 MiB geometry table with the 2070 (other TU106 capacities need the table extended first) |
-| TU102/TU104/TU116 (rest of the 20/16 series) | 1e02–1fff, 2182–21d1 etc. | 🟢 same-family assets + community silicon proof (2080Ti 22G chenxluo +51-75%, 2080Ti 11G nlzy/haohervchb ~1.6×, same chain) |
-| Turing and older (Pascal…) | — | ❌ no transaction track |
+| TU102/TU104/TU116 (rest of the 20/16 series) | 1e02–1fff, 2182–21d1 etc. | 🟢 same-family assets + community silicon proof (2080Ti 22G chenxluo +51–75%, 2080Ti 11G nlzy/haohervchb ~1.6×, same chain, structurally identical). **No EFI-side success yet**; tracking: 2080 Ti 22G `1e07` 0x91 ([issue #17](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/17)), 2080 `1e87` 0x91 ([issue #62](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/62)), 2080S `1e81` EFI unlock succeeded but the GSP handoff bug-checks ([issue #55](https://github.com/physicsdolphin/nv-uefi-unlocker/issues/55)) |
+| Older than Turing (Pascal…) | — | ❌ no transaction track |
 | Blackwell (50 series) / GA100 | — | ❌ different chain, out of scope |
 
 ## Turing (20 series) prerequisite: GSP firmware mode (must read)
@@ -466,10 +520,13 @@ BINDATA 4 KiB v4 map nor the GSP ELF's first 0x6000 (`c76c43b1...`) is
 it; the maker double-checks both the source archive and the output, and a
 length or hash mismatch is a hard failure.
 
-**After the Turing 2070 unlock — I forgot to take a "before" screenshot;
-owners of the same card are welcome to run it themselves and see for
-themselves:**
+**Turing 2070 before vs after the unlock — owners of the same card are
+welcome to run it themselves and see:**
 
+Before:
+<img width="800" height="400" alt="image" src="https://github.com/user-attachments/assets/6e61c642-7202-47a6-b6a0-cc2d986892d3" />
+
+After:
 <img width="800" height="450" alt="image" src="https://github.com/user-attachments/assets/8c103363-8e44-4d46-ab47-a6c063ae1e6f" />
 
 **When it does not work / misbehaves**: open an
@@ -537,6 +594,28 @@ sysmem; switching the FBIF TARGET has no effect), see
 > SVM/VT-x; the bridge Bus Master bit is PCI Command Register bit 2 and
 > has nothing to do with "Virtualization".
 
+### Known issue (fixed in the loader): AMI pathless GOP child resets the platform after a successful transaction
+
+**Symptom**: the whole transaction is green (`MAILBOX0=0x67b00001`, PLM read-backs,
+`POST-FLR: verified`), then the PC resets or hangs on a black screen before Windows starts. Releases
+before v2.1.5 left `loader.log` at 0 bytes in this case, because the log was only flushed right
+before the chain-load.
+
+**Root cause** (PR #13, found on an ASUS ROG MAXIMUS Z790 APEX + RTX 4060 Ti 8 GB): this AMI firmware
+layers a **GOP child with no device path** (a firmware splitter/console handle) on top of the NVIDIA
+GOP. The detach removes the NVIDIA GOP, but the pathless child survives. A **recursive**
+`ConnectController` then re-binds the console stack over that stale child, and the platform resets
+inside the call. Two places did this: `reconnect_all` right after the post-FLR verdict, and the
+`map -r`-style pass in `chain_load_bootmgfw`, which reconnected every PciIo handle including the GPU.
+
+**Fix**: built into the loader (PR #13; node-aligned GOP ownership in `fe92339`). The reconnect stays
+recursive by default (single-GOP boards are unchanged) and connects the vendor GOP only when a
+pathless GOP survived the detach; the pre-chain pass skips NVIDIA display functions; `loader.log` is
+flushed during the run. On an affected board the log shows
+`RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)`, and `\no-reconnect.txt`
+skips the reconnect entirely if a board still misbehaves. Evidence: `docs/evidence/ad106-asus-z790/`,
+write-up `docs/ad106-asus-z790-windows-unlock.md`.
+
 > The maintainer works on this **part-time** and may not see or answer
 > issues immediately — the logs are kept and will be reviewed; patience
 > appreciated.
@@ -547,10 +626,13 @@ sysmem; switching the FBIF TARGET has no effect), see
 loader/    EFI application crate (no_std, x86_64-unknown-uefi, Rust + uefi-rs)
 assets/    host-side asset pipeline (pinned-hash download/verify/extract/payload generation, pure Rust)
 sim/       behavioral simulator + transaction state-machine tests (GPU-free development)
+tools/     ssdiag: in-OS Windows unlock verdict / no-reboot repair (pmxdrv.sys embedded)
 docs/      reports, milestone evidence (evidence-as-commits), register cold-value tables, open questions
 ```
 
 ## Safety constitution (copy, equivalent to AGENTS.md §1; violating any single item stops the work)
+
+The loader currently records PROM CRC32 fingerprints. Per-card ROM/PROM SHA-256 pinning, required below, is pending; see [implementation status](docs/community-reports.md#使用说明与实现边界).
 
 1. **Read-back is the only success criterion.** Status codes, return
    values, interrupts and self-test output never count as proof of
@@ -598,13 +680,67 @@ power cycle; last resort DDU + driver reinstall (this tool writes nothing
 persistent; a misbehaving driver can only come from handoff timing, not
 permanent damage).
 
+## In-OS unlock verdict and repair on Windows: `tools/ssdiag`
+
+Answers "is the unlock still live this boot?" without a reboot, and on
+Ampere/Ada supports a **no-reboot repair**: when the FEAT gate is open but
+the SS overrides were re-derived away by driver devinit (driver init,
+sleep/resume, Thunderbolt rail re-enumeration), `--reapply` writes
+SS0=0x88888888 / SS1=0x8 back and verifies by read-back (the
+separate-lock method, issues #6/#19 lineage). On the Turing relock chain
+the gate is closed inside Windows, so the tool stays read-only there —
+but the Turing SS values persist for the whole Windows session, so the
+in-OS read-back **is** a valid verdict; gate closed = re-run the stick.
+
+```text
+ssdiag                        # verdict: dump every NVIDIA display GPU
+ssdiag --reapply              # repair: write the SS overrides back where the gate is open
+ssdiag --select 2504          # multi-GPU: only cards whose DeviceID contains 2504
+```
+
+Capabilities and boundaries (v0.4.x):
+
+- **BAR0 is always discovered from the OS** (physical assignments change
+  every boot; a remembered base once hard-hung a machine, so stale
+  addresses are refused). Multi-GPU: per-card dumps grouped by DeviceID,
+  Display-class functions only (companion audio/USB-C excluded).
+- The dump surface is the union of the registers the reference unlockers
+  touch: the core/debug block (PMC_BOOT_0, PSTRAPS decoded, FB_SIZE_MIB,
+  GFW, BSI_SCRATCH15, WPR2, MMU PLM + lock, GSP/SEC2, fuse rows), **FEAT
+  clusters of both families** (Turing 0x4096xx incl. READOUT, Ampere/Ada
+  0x823xxx), the Ada four-write targets (WPR/WPR_CFG/FBPA PLMs), the
+  AD10x 64G-BAR1 line (CYA/CFG/XVE/cap mirror), the 26-register
+  PLM survey, the Ampere FEAT sweep. Read-backs are badf-bucketed
+  (PRIV_VIOLATION / UNDECODED / FLOORSWEPT) with colored verdicts and
+  addresses (pipes/`NO_COLOR` degrade to plain text).
+- Families Maxwell..Rubin recognized (incl. the GA10x
+  `BOOT_0=0xb7xx00a1` quirk); the FEAT unlock verdict only where the
+  cluster is mapped (Turing/Ampere/Ada).
+- GPUs reading degenerate are woken on demand via the driver's own NVAPI
+  GC6Control (GC6/GCOFF parking; field-proven on a 4060 Laptop).
+- Driver safety: `pmxdrv.sys` (Intel-signed, hash-pinned at build time,
+  re-verified at startup fail-closed) is **embedded in the exe**, deployed
+  under its own service name `SSDIAG_PMXDRV`, and on every exit path the
+  service is stopped + deleted and the temp file removed; services owned
+  by other tools are never touched. If a PMXDRV device already exists
+  (e.g. deployed by nvoc) it is borrowed with zero service changes. The
+  deploy path needs admin (borrowing a running device works unelevated).
+- Thunderbolt eGPUs: a reapply is only meaningful while the rail stays
+  powered (see the Thunderbolt section above).
+
+Get it: the release zip ships `ssdiag-x86_64-windows.exe` since v2.1.5;
+source in `tools/ssdiag` (standalone crate, `cargo build --release` to
+rebuild — see its `README.md`).
+
+<img width="750" height="780" alt="image" src="https://github.com/user-attachments/assets/d475654e-bc0a-4def-b48a-05ff6095b118" />
+
 ## Build
 
 ```
 cargo build --release   # host crates (assets/sim) — the loader is not in default-members
 cargo efi               # read-only EFI build (M0/M1 diagnostics)
 cargo efi-tx            # gated transaction build (write paths; explicit use only)
-cargo xt                # all host tests (assets 19 + sim 44)
+cargo xt                # all host tests (assets + sim; see current test output for counts)
 ```
 
 A bare `cargo build --workspace` tries to build the loader for the host

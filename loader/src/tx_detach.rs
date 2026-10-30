@@ -36,6 +36,40 @@ fn device_path_bytes(handle: Handle) -> Option<alloc::vec::Vec<u8>> {
     Some(dp.as_bytes().to_vec())
 }
 
+/// Node-aligned device-path ownership: `child` belongs to `parent` when the
+/// parent's node sequence (its END node excluded) appears byte-exact at the
+/// same offsets in `child`.
+///
+/// The raw byte-prefix compare this replaces failed on every NVIDIA GOP so
+/// far seen: the child path replaces the parent's trailing END node with
+/// extra nodes (an AcpiAdr display node) before its own END, so the compare
+/// tripped over the parent's END bytes and the target's own GOP read as
+/// "foreign". Instances: the issue #14 flip board, the ASUS Z790 2803
+/// report (stage 1 never ran there), and the TU106 1f07 regression log of
+/// 2026-10-28 (GOP-TOPOLOGY: 36 B present, gone after the GPU PCI
+/// disconnect, back after reconnect - the dGPU's own GOP, judged foreign).
+/// Reference implementation + shape tests: sim/src/devpath.rs.
+pub fn path_belongs_to(parent: &[u8], child: &[u8]) -> bool {
+    // Byte offset where the parent's END node (type 0x7f) begins; a
+    // malformed node (length < 4 or past the buffer) ends the walk.
+    let mut body = 0usize;
+    let mut nodes = 0usize;
+    let mut i = 0usize;
+    while i + 4 <= parent.len() {
+        let len = u16::from_le_bytes([parent[i + 2], parent[i + 3]]) as usize;
+        if len < 4 || i + len > parent.len() || parent[i] == 0x7f {
+            break;
+        }
+        body = i + len;
+        nodes += 1;
+        i += len;
+    }
+    if nodes == 0 {
+        return false;
+    }
+    child.len() >= body && child[..body] == parent[..body]
+}
+
 /// Does this GOP handle belong to the target GPU? The vendor GOP child
 /// handle's device path extends the PCI device path, so a node-aligned
 /// prefix match identifies ownership. A false "no" is safe: the stage-3
@@ -43,8 +77,80 @@ fn device_path_bytes(handle: Handle) -> Option<alloc::vec::Vec<u8>> {
 /// check only decides whether we ALSO tear down other cards' GOPs.
 fn gop_belongs_to_target(gop: Handle, pci_handle: Handle) -> bool {
     match (device_path_bytes(pci_handle), device_path_bytes(gop)) {
-        (Some(p), Some(g)) => g.len() >= p.len() && g[..p.len()] == p[..],
+        (Some(p), Some(g)) => path_belongs_to(&p, &g),
         _ => false,
+    }
+}
+
+/// EFI_OPEN_PROTOCOL_INFORMATION_ENTRY (UEFI spec 7.3).
+#[repr(C)]
+struct OpenInfo {
+    agent: *mut core::ffi::c_void,
+    controller: *mut core::ffi::c_void,
+    attributes: u32,
+    open_count: u32,
+}
+
+/// Read-only: log every open of `guid` on `handle` (agent, controller,
+/// attributes) via OpenProtocolInformation. Attributes: 0x8 BY_CHILD,
+/// 0x10 BY_DRIVER, 0x20 EXCLUSIVE. Maps which drivers sit on which display
+/// handle before anything is disconnected.
+fn log_openers(label: &str, handle: Handle, guid: &uefi::Guid) {
+    let Some(st) = uefi::table::system_table_raw() else {
+        return;
+    };
+    // Safety: boot services are live; the table pointer comes from the
+    // firmware and the returned buffer is freed with FreePool below.
+    unsafe {
+        let bt = st.as_ref().boot_services;
+        if bt.is_null() {
+            return;
+        }
+        let mut buf: *mut OpenInfo = core::ptr::null_mut();
+        let mut n: usize = 0;
+        let s = ((*bt).open_protocol_information)(
+            handle.as_ptr(),
+            guid,
+            (&mut buf as *mut *mut OpenInfo).cast(),
+            &mut n,
+        );
+        if s != uefi::Status::SUCCESS || buf.is_null() {
+            info!("DIAG {label}: {:?} OpenProtocolInformation {:?}", handle, s);
+            return;
+        }
+        for i in 0..n {
+            let e = &*buf.add(i);
+            info!(
+                "DIAG {label}: {:?} agent={:p} controller={:p} attr={:#x} count={}",
+                handle, e.agent, e.controller, e.attributes, e.open_count
+            );
+        }
+        if let Some(p) = core::ptr::NonNull::new(buf.cast::<u8>()) {
+            let _ = boot::free_pool(p);
+        }
+    }
+}
+
+/// Read-only display topology: every GOP handle with its device-path
+/// length, target ownership and GOP openers, plus the PciIo openers on the
+/// GPU. Pathless GOPs (firmware splitters / ConSplitter) are skipped by the
+/// detach below; this records what stays alive on top of the target.
+fn log_display_topology(pci_handle: Handle) {
+    log_openers("PCIIO-OPENERS", pci_handle, &PciIo::GUID);
+    let Ok(h) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) else {
+        info!("DIAG GOP-TOPOLOGY: no GOP handles");
+        return;
+    };
+    for i in 0..h.len() {
+        let gop = h[i];
+        info!(
+            "DIAG GOP-TOPOLOGY: {:?} devpath_len={:?} on_target={} protocols={}",
+            gop,
+            device_path_bytes(gop).map(|b| b.len()),
+            gop_belongs_to_target(gop, pci_handle),
+            open_count(gop)
+        );
+        log_openers("GOP-OPENERS", gop, &GraphicsOutput::GUID);
     }
 }
 
@@ -82,7 +188,7 @@ pub fn pm_preflight(pci: &PciIo) -> Result<PmEntry, &'static str> {
     info!("PM: entry PMCSR={before:#06x} state=D{} (cap@{cap:#04x})", before & 0x3);
     if warm {
         info!("PM: WARM ENTRY (resume/fast-startup handoff, not a POST): the previous session's device context is still in this function; the unlock may not survive the Windows handoff");
-        if crate::tx::read_boot_file("\\tx-require-d0.txt").is_some() {
+        if crate::tx::probe_file("\\tx-require-d0.txt") {
             info!("PM: \\tx-require-d0.txt present - aborting before any GPU write (use Restart, or cold boot, and re-run)");
             return Err("warm entry with require-D0 switch set");
         }
@@ -101,6 +207,7 @@ pub fn pm_preflight(pci: &PciIo) -> Result<PmEntry, &'static str> {
 /// while exclusively owned (drift reference for the post-transaction check).
 pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'static str> {
     info!("DETACH: staged console/driver detach begin (TOTORONG craft)");
+    log_display_topology(pci_handle);
 
     // Stage 1+2: disconnect every driver bound to the TARGET GPU's GOP
     // handle (ConSplitter TextOut agent + GraphicsConsole; the UEFI
@@ -112,10 +219,23 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
     // still guarantees the target's own stack comes off.
     let gop_handles =
         boot::locate_handle_buffer(boot::SearchType::ByProtocol(&GraphicsOutput::GUID));
+    // A/B isolation (issue #14 flip): the prefix check misclassified the
+    // target's own GOP on at least one single-GPU board (the board had no
+    // Intel VGA in PCI enumeration, yet the GOP was declared "not on the
+    // target GPU"), so v2.1.0-pre..v2.1.2 left the console connected where
+    // v0.2.0 disconnected it - the only transaction-path delta on the
+    // machine that flipped 0x91 -> unlocked. \tx-gop-disconnect.txt forces
+    // the v0.2.0 behavior (disconnect every GOP handle) so the GOP variable
+    // can be tested one boot per side on otherwise identical code.
+    let force_gop_disconnect =
+        crate::tx::probe_file("\\tx-gop-disconnect.txt");
+    if force_gop_disconnect {
+        info!("DETACH: \\tx-gop-disconnect.txt present - disconnecting every GOP handle (v0.2.0 behavior)");
+    }
     if let Ok(h) = gop_handles {
         for i in 0..h.len() {
             let gop = h[i];
-            if !gop_belongs_to_target(gop, pci_handle) {
+            if !force_gop_disconnect && !gop_belongs_to_target(gop, pci_handle) {
                 info!("DETACH: GOP handle {:?} is not on the target GPU (multi-GPU) - left untouched, its console stays alive", gop);
                 continue;
             }
@@ -144,6 +264,7 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
         before,
         after
     );
+    log_display_topology(pci_handle);
 
     // Exclusive claim: re-open EXCLUSIVE (this fails while any other driver
     // still holds the PCI I/O protocol - the TOTORONG acceptance gate).
@@ -203,10 +324,50 @@ pub fn detach_and_claim(pci_handle: Handle) -> Result<alloc::vec::Vec<u32>, &'st
 /// self-establishes its own console when it starts; this only restores the
 /// display earlier for machines where the dGPU is the primary adapter.
 pub fn reconnect_all(pci_handle: uefi::Handle) {
-    // Give the FLR-rebooted function a moment, then recursive-connect.
+    if crate::tx::probe_file("\\no-reconnect.txt") {
+        info!("RECONNECT: skipped (\\no-reconnect.txt) - bootmgfw self-establishes its console");
+        return;
+    }
+    // Give the FLR-rebooted function a moment, then reconnect. Recursive by
+    // default (verified on single-GOP desktops). If a pathless GOP survived
+    // the detach (an AMI splitter child, ASUS Z790 + 2803), connect the
+    // vendor GOP driver only: the recursive connect re-binds the console
+    // stack over the stale child and the platform resets inside the call.
+    // bootmgfw locates the fresh vendor GOP on its own.
     boot::stall(core::time::Duration::from_millis(200));
-    match boot::connect_controller(pci_handle, &[], None, true) {
-        Ok(()) => info!("RECONNECT: ConnectController recursive ok"),
+    // Diagnostic switch (issues #35/#61): on a family of boards the
+    // recursive rebind deadlocks inside the firmware right here (detach
+    // leaves zero GOP handles -> stale_pathless_gop()=false ->
+    // recursive=true). The marker forces the vendor-GOP-only bind PR#13
+    // validated on the pathless-survivor shape and leaves the console
+    // stack to bootmgfw - the Z170-A control proved bootmgfw's own
+    // re-establishment suffices whenever it can bind at all.
+    let force_nonrec = crate::tx::read_boot_file("\\tx-reconnect-nonrecursive.txt").is_some();
+    let recursive = if force_nonrec {
+        info!("RECONNECT: \\tx-reconnect-nonrecursive.txt present - forcing NON-recursive (vendor GOP bind only; console stack left to bootmgfw)");
+        false
+    } else {
+        !stale_pathless_gop()
+    };
+    info!("RECONNECT: ConnectController (recursive={recursive}) begin");
+    match boot::connect_controller(pci_handle, &[], None, recursive) {
+        Ok(()) => info!("RECONNECT: ConnectController ok (recursive={recursive})"),
         Err(e) => info!("RECONNECT: ConnectController failed: {:?} (bootmgfw will self-establish)", e.status()),
     }
+    log_display_topology(pci_handle);
+}
+
+/// True if any GOP handle without a device path is still installed. Called
+/// after the detach, when the target's vendor GOP is gone: a pathless GOP
+/// left over is a firmware splitter/console child (AMI) that a recursive
+/// reconnect would re-bind over.
+pub fn stale_pathless_gop() -> bool {
+    let Ok(h) = boot::locate_handle_buffer(boot::SearchType::ByProtocol(&GraphicsOutput::GUID)) else {
+        return false;
+    };
+    let stale = h.iter().any(|&gop| device_path_bytes(gop).is_none());
+    if stale {
+        info!("RECONNECT: pathless GOP survived the detach - vendor GOP only (non-recursive)");
+    }
+    stale
 }

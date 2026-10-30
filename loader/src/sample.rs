@@ -69,7 +69,7 @@ fn classify(v: u32) -> &'static str {
         "PRIV_VIOLATION"
     } else if v == 0xBADF_1100 {
         "UNDECODED"
-    } else if v & 0xFFFF_0000 == 0xBADF_2000 {
+    } else if v & 0xFFFF_FF00 == 0xBADF_2000 {
         "FLOORSWEPT"
     } else if v >> 16 == 0xBADF {
         "BADF_VARIANT"

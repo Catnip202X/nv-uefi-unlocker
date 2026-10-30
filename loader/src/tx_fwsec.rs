@@ -326,15 +326,60 @@ pub fn layout_from_registers(
     );
     // FB_SIZE_MIB is PLM-LOCKED at PL0 on Turing (measured 2026-10-26/27:
     // badf5040, unlike Ada where it reads) - first fire failed exactly here.
-    // The community-proven path (cmp50hx detect_fb_size) derives geometry
-    // from the SKU instead: 10de:1f07 (RTX 2070, TU106) has 8 GiB.
+    // Driver-exact source instead: NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE
+    // (0x100ce0 on TU102, GP102 layout) is programmed by VBIOS devinit with
+    // the USABLE FB window and the GSP booter validates WprMeta.fbSize
+    // against the same value - kmemsysReadUsableFbSize_GP102 decodes
+    // mag[27:4] << (scale[3:0]+20) and keeps 15/16 when ECC (bit30) is on.
+    // The #17 card reads 0x2c9 = 44 << 29 = 22528 MiB, exactly the C
+    // reference fbSize; issue #57's nominal-24G TITAN RTX reporting 0x11
+    // with a marker-fed 24G makes a smaller usable window (ECC, devinit
+    // reserve) the prime suspect - decode, log, and never guess.
     let fb_mib = if inaccessible(fb_raw) {
         if family == "tu10x" {
             const FB_MIB_TU106_1F07: u32 = 8192;
-            info!(
-                "layout: FB_SIZE_MIB PLM-locked on Turing ({fb_raw:#010x}) - using SKU geometry 8192 MiB (10de:1f07); refuse and extend the table for other TU106 SKUs"
-            );
-            FB_MIB_TU106_1F07
+            const LOCAL_MEMORY_RANGE: u32 = 0x0010_0ce0;
+            let lmr = gpu.read32_raw(LOCAL_MEMORY_RANGE);
+            let decoded_mib = if !inaccessible(lmr) {
+                let mag = (lmr >> 4) & 0x00ff_ffff; // [27:4]
+                let scale = lmr & 0xf; // [3:0]
+                let bytes = (mag as u64) << (scale + 20);
+                let bytes = if lmr & (1 << 30) != 0 { bytes / 16 * 15 } else { bytes };
+                let mib = (bytes >> 20) as u32;
+                (mib >= 256 && mib <= 64 * 1024).then_some(mib)
+            } else {
+                None
+            };
+            match decoded_mib {
+                Some(mib) => {
+                    info!(
+                        "layout: LOCAL_MEMORY_RANGE {lmr:#010x} decoded usable FB = {mib} MiB (ecc={}) - driver source",
+                        lmr & (1 << 30) != 0
+                    );
+                    mib
+                }
+                None => {
+                    // \tu10x-fb-gb.txt override (issue #17): manual escape
+                    // hatch when the register decode is gated or implausible.
+                    // Plain decimal GiB; everything downstream (vga/frts/wpr/
+                    // heap) keys off this one number.
+                    let override_mib = crate::tx::read_boot_file("\\tu10x-fb-gb.txt")
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(str::trim).and_then(|s| s.parse::<u64>().ok()))
+                        .filter(|g| *g >= 1 && *g <= 64);
+                    match override_mib {
+                        Some(gib) => {
+                            info!("layout: \\tu10x-fb-gb.txt override: FB size = {gib} GiB (register decode skipped: {lmr:#010x})");
+                            (gib * 1024) as u32
+                        }
+                        None => {
+                            info!(
+                                "layout: FB_SIZE_MIB PLM-locked on Turing ({fb_raw:#010x}), LOCAL_MEMORY_RANGE {lmr:#010x} undecodable - using SKU geometry 8192 MiB (10de:1f07); refuse and extend the table for other TU106 SKUs"
+                            );
+                            FB_MIB_TU106_1F07
+                        }
+                    }
+                }
+            }
         } else {
             return Err(TxError::EIO);
         }
@@ -453,7 +498,7 @@ pub fn fwsec_ignite(gpu: &TxGpu, layout: &LayoutOut) -> Result<(), TxError> {
         return Err(TxError::ENodev);
     }
     let rom: &[u8] = unsafe { core::slice::from_raw_parts(rom_words.as_ptr() as *const u8, mapped) };
-    info!("FWSEC: PROM bytes={mapped} signature={:#x}", rom[0] as u16 | 0);
+    info!("FWSEC: PROM bytes={mapped} signature={:#06x}", le16(rom, 0));
 
     let fw = match prom_find_fwsec(&rom, false) {
         Some(f) => f,
@@ -793,9 +838,17 @@ pub fn scrubber_if_needed(gpu: &TxGpu) -> Result<(), TxError> {
         return Ok(());
     }
 
-    let bundle = crate::tx::read_boot_file("\\scrubber_ad10x.bin")
-        .ok_or(TxError::ENodev)
-        .inspect_err(|_| info!("SCRUB: \\scrubber_ad10x.bin missing on boot volume"))?;
+    let bundle = match crate::tx::read_asset("\\scrubber_ad10x.bin") {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            info!("SCRUB: \\scrubber_ad10x.bin missing on boot volume");
+            return Err(TxError::ENodev);
+        }
+        Err(()) => {
+            info!("SCRUB: \\scrubber_ad10x.bin is present but unreadable - refusing to fire a partial image");
+            return Err(TxError::ENodev);
+        }
+    };
     let (hdr, image, sigs) = crate::tx_booter::load_booter(&bundle, "scrub")?;
     info!(
         "SCRUB: bundle ok - code {:#x}+{:#x}@va{:#x} data {:#x}+{:#x} patch {:#x} ucode {:#x}",

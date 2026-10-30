@@ -39,6 +39,21 @@ pub mod regs {
     pub const CPUCTL_HALTED: u32 = 0x10;
 }
 
+/// Registers a host write may only reach once the FEAT_OVR_PLM mask is open.
+/// The gate register itself is included on purpose: it is writable from the
+/// payload (heavy-secure) only, never from the host.
+pub fn is_plm_protected(off: u32) -> bool {
+    matches!(
+        off,
+        regs::FEAT_PLM
+            | regs::FEAT_SS0
+            | regs::FEAT_SS1
+            | regs::WPRCFG_PLM
+            | regs::WPR_PLM
+            | regs::FBPA_PLM
+    )
+}
+
 /// What the fake SEC2 does when started.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum BootMode {
@@ -154,9 +169,17 @@ impl FakeGpu {
     }
 
     pub fn write(&mut self, off: u32, v: u32) {
-        // Privilege model: FEAT block writes are dropped at L0 unless PLM open.
+        // Privilege model (AGENTS §2 / task brief §3.2): a host write to a
+        // PLM-protected register is SILENTLY DROPPED while the block's mask
+        // reads locked. This has to cover the mask register itself and every
+        // register the payload chain writes - not just the two selectors.
+        // Otherwise "open 0x823804 from the host", which the silicon refuses
+        // outright, is the one wrong implementation the model cannot catch,
+        // and M2 exists precisely to catch it.
+        // Deliberately NOT filtered: WPR2_LO/HI (the reference re-arms them
+        // from the host before every fire; they are GFW-owned, not PLM-gated).
         let plm_open = self.regs[self.idx(regs::FEAT_PLM)] == 0xffff_ffff;
-        if matches!(off, regs::FEAT_SS0 | regs::FEAT_SS1) && !plm_open {
+        if !plm_open && is_plm_protected(off) {
             return; // silently dropped, as the hardware does
         }
         if off == regs::FEAT_SS0 && self.selector_bad == 1 {
@@ -255,6 +278,7 @@ mod scenarios;
 #[cfg(test)]
 mod scenarios2;
 
+pub mod devpath;
 pub mod dma;
 pub mod layout;
 pub mod radix;

@@ -23,6 +23,7 @@ pub enum HsError {
 }
 
 /// falcon_hs prevalidation. Returns the code source DMA address.
+#[allow(clippy::too_many_arguments)] // 1:1 falcon_hs prevalidation knobs (kernel-matching shape)
 pub fn hs_prevalidate(
     image: u64,
     code_off: u32,

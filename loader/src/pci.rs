@@ -15,6 +15,8 @@ use log::info;
 use uefi::boot::AllocateType;
 use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams, SearchType};
 #[cfg(feature = "tx")]
+use uefi::mem::memory_map::MemoryMap as _;
+#[cfg(feature = "tx")]
 use uefi::mem::memory_map::MemoryType;
 use uefi::proto::unsafe_protocol;
 use uefi::{Identify, Status};
@@ -31,6 +33,45 @@ static TX_HIGH_STAGING: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 #[cfg(feature = "tx")]
 pub fn set_high_staging(on: bool) {
     TX_HIGH_STAGING.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "tx")]
+static MEMMAP_CAPTURED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Capture the memory map once per boot - every descriptor ending at/above
+/// 2 GiB, ALL types, not just conventional: what the firmware did with the
+/// high RAM is the open question behind the per-board 0x91 differences
+/// (issues #16/#17/#19). Runs before the first allocation so it lands in
+/// every log, success or failure.
+#[cfg(feature = "tx")]
+fn capture_memmap_once() {
+    if MEMMAP_CAPTURED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(mmap) = boot::memory_map(MemoryType::BOOT_SERVICES_DATA) else {
+        info!("MEMMAP: capture failed");
+        return;
+    };
+    let mut lines = 0u32;
+    let mut above4g = 0u32;
+    for d in mmap.entries() {
+        let end = d.phys_start.saturating_add((d.page_count as u64) * 4096);
+        if d.ty == MemoryType::CONVENTIONAL && d.phys_start >= 0x1_0000_0000 {
+            above4g += 1;
+        }
+        if end >= 0x8000_0000 && lines < 32 {
+            info!(
+                "MEMMAP: {:#x}-{:#x} ({} MiB) type={:?} attr={:?}",
+                d.phys_start,
+                end,
+                ((d.page_count as u64) * 4096) >> 20,
+                d.ty,
+                d.att
+            );
+            lines += 1;
+        }
+    }
+    info!("MEMMAP: {above4g} conventional descriptors above 4GB");
 }
 
 /// EFI_PCI_IO_PROTOCOL_WIDTH (only the fixed-width variants are named here).
@@ -168,6 +209,7 @@ impl PciIo {
 
     /// BAR memory write of `count` u32 scalars via `Mem.Write` (the only
     /// host-to-VRAM bulk path: BAR1 into the framebuffer).
+    #[allow(dead_code)] // BAR write path: consumed by the TX transaction only
     fn mem_write_raw(&self, width: PciWidth, bar: u8, offset: u64, count: usize, buf: *mut c_void) -> Status {
         // Safety: exclusive-borrowed protocol; caller owns the source buffer.
         unsafe { (self.0.mem.write)(&self.0 as *const _ as *mut _, width, bar, offset, count, buf) }
@@ -260,6 +302,30 @@ impl PciIo {
         None
     }
 
+    /// Walk the legacy capability list for the PCI Express capability
+    /// (ID 0x10). The FLR path must locate it instead of assuming 0x78: that
+    /// offset is right on every card measured here, but nothing guarantees it,
+    /// and "Device Control bit 15" written into an unrelated dword is not a
+    /// reset - it is an arbitrary config-space write that leaves the function
+    /// untouched. Same iteration guard as `pm_cap` (a self-referential chain
+    /// would otherwise hang the firmware app with no log line).
+    #[cfg(feature = "tx")]
+    pub fn pcie_cap(&self) -> Option<u8> {
+        if self.config_read_u16(0x06) & 0x10 == 0 {
+            return None; // STATUS.CAP_LIST absent
+        }
+        let mut ptr = self.config_read_u8(0x34) & 0xfc;
+        let mut guard = 0;
+        while ptr != 0 && guard < 48 {
+            if self.config_read_u8(ptr.into()) == 0x10 {
+                return Some(ptr);
+            }
+            ptr = self.config_read_u8(ptr as u32 + 1) & 0xfc;
+            guard += 1;
+        }
+        None
+    }
+
     /// PMCSR read (PM capability + 4). Bits 1:0 = PowerState.
     #[cfg(feature = "tx")]
     pub fn pmcsr(&self, cap: u8) -> u16 {
@@ -292,6 +358,7 @@ impl PciIo {
     /// through legal coherent memory types before giving up.
     #[cfg(feature = "tx")]
     pub fn dma_alloc(&self, len: usize) -> Result<DmaBuffer, Status> {
+        capture_memmap_once();
         // Above-4GB staging first, gated per family (see set_high_staging):
         // issues #14/#16 (2026-10-28) - the booter's first host DMA pulls
         // the WprMeta into SEC2 DMEM, and on some Turing cards a sub-4GB
@@ -304,7 +371,7 @@ impl PciIo {
         // \tx-low-staging.txt forces the legacy PciIo path for A/B testing.
         if !TX_HIGH_STAGING.load(core::sync::atomic::Ordering::Relaxed) {
             info!("DMA alloc: family not gated for >4GB staging - legacy PciIo path");
-        } else if crate::tx::read_boot_file("\\tx-low-staging.txt").is_some() {
+        } else if crate::tx::probe_file("\\tx-low-staging.txt") {
             info!("DMA alloc: \\tx-low-staging.txt present - legacy sub-4GB PciIo path forced");
         } else if let Ok(b) = self.dma_alloc_high(len) {
             return Ok(b);
@@ -358,7 +425,11 @@ impl PciIo {
                 let _st = unsafe { (self.0.free_buffer)(&self.0 as *const _ as *mut _, pages, host) };
                 continue;
             }
-            log::info!("DMA alloc: {} pages memtype={name} dev={:#x}", pages, device);
+            // The band is derived from the actual device address, not from
+            // which branch ran (issue #19: a "HIGH" label on a sub-4GB
+            // address is worse than no label).
+            let band = if device >= 0x1_0000_0000 { "HIGH" } else { "LOW" };
+            log::info!("DMA alloc: {pages} pages memtype={name} dev={device:#x} [{band}] (PciIo)");
             return Ok(DmaBuffer { host: host as *mut u8, dev: device, mapping, pages, len, released: false, high: false });
         }
         Err(Status::OUT_OF_RESOURCES)
@@ -372,24 +443,62 @@ impl PciIo {
     /// are 64-bit DMA masters (the driver itself stages at 0x110BB0000).
     #[cfg(feature = "tx")]
     fn dma_alloc_high(&self, len: usize) -> Result<DmaBuffer, Status> {
+        const FOUR_GB: u64 = 0x1_0000_0000;
         let pages = len.div_ceil(4096);
-        let ptr = boot::allocate_pages(
-            AllocateType::MaxAddress(u64::MAX),
-            MemoryType::BOOT_SERVICES_DATA,
-            pages,
-        )
-        .map_err(|_| Status::OUT_OF_RESOURCES)?;
-        let dev = ptr.as_ptr() as usize as u64;
-        info!("DMA alloc: {pages} pages memtype=EfiBootServicesData HIGH dev={dev:#x}");
-        Ok(DmaBuffer {
-            host: ptr.as_ptr(),
-            dev,
-            mapping: core::ptr::null_mut(),
-            pages,
-            len,
-            released: false,
-            high: true,
-        })
+        // MaxAddress(u64::MAX) is NOT "allocate at the top of RAM": DxeCore's
+        // CoreFindFreePagesI selects the highest free range UNDER the cap
+        // (Target=0, best match = DescEnd > Target), and on the field boards
+        // that range sat at 1-2 GiB - v2.1.1's "HIGH" allocations landed at
+        // 0x81e83000 et al (issues #17/#19). Walk the memory map ourselves
+        // and AllocateAddress inside a conventional descriptor at/above
+        // 4 GiB: per spec this lands exactly at the requested address or
+        // fails, so placement is deterministic on any firmware.
+        let mmap = boot::memory_map(MemoryType::BOOT_SERVICES_DATA)
+            .map_err(|_| Status::OUT_OF_RESOURCES)?;
+        let mut candidates = 0u32;
+        let mut failed = 0u32;
+        for d in mmap.entries() {
+            if d.ty != MemoryType::CONVENTIONAL {
+                continue;
+            }
+            let base = d.phys_start;
+            let end = base.saturating_add((d.page_count as u64) * 4096);
+            let start = base.max(FOUR_GB);
+            if start >= end || (end - start) < (pages as u64) * 4096 {
+                continue;
+            }
+            candidates += 1;
+            if let Ok(ptr) = boot::allocate_pages(
+                AllocateType::Address(start),
+                MemoryType::BOOT_SERVICES_DATA,
+                pages,
+            ) {
+                let dev = ptr.as_ptr() as usize as u64;
+                let band = if dev >= FOUR_GB { "HIGH" } else { "LOW" };
+                info!(
+                    "DMA alloc: {pages} pages memtype=EfiBootServicesData {band} dev={dev:#x} (descriptor {base:#x}+{:#x})", (d.page_count as u64) * 4096
+                );
+                return Ok(DmaBuffer {
+                    host: ptr.as_ptr(),
+                    dev,
+                    mapping: core::ptr::null_mut(),
+                    pages,
+                    len,
+                    released: false,
+                    high: true,
+                });
+            }
+            failed += 1;
+            if failed >= 4 {
+                break;
+            }
+        }
+        // Full map picture is already captured once per boot (capture_memmap_once,
+        // called from dma_alloc before any allocation).
+        info!(
+            "DMA alloc: no usable >4GB conventional space (candidates={candidates} failed={failed})"
+        );
+        Err(Status::NOT_FOUND)
     }
 
     /// Bulk u32 read from a BAR window (used for the PROM CRC pass).
@@ -399,6 +508,7 @@ impl PciIo {
 
     /// Bulk u32 write into a BAR window (VRAM fallback staging via BAR1).
     /// `buf.len()` must be a multiple of 4.
+    #[allow(dead_code)] // BAR write path: consumed by the TX transaction only
     pub fn bar_write_buf(&self, bar: u8, offset: u64, buf: &[u8]) -> Status {
         self.mem_write_raw(PciWidth::Uint32, bar, offset, buf.len() / 4, buf.as_ptr() as *mut c_void)
     }
@@ -633,17 +743,38 @@ fn parse_bdf(raw: &[u8]) -> Option<(usize, usize, usize, usize)> {
     Some((seg, bus, dev, fun))
 }
 
+/// Resolve the PCI Express capability offset for the FLR path. The walk is
+/// authoritative; the historical 0x78 is only a fallback for a firmware/card
+/// combination where the capability list itself is unreadable, and it is
+/// logged so the evidence record shows which branch ran.
+#[cfg(feature = "tx")]
+pub fn pcie_cap_or_measured(gpu: &PciIo) -> u8 {
+    match gpu.pcie_cap() {
+        Some(c) => {
+            if c != 0x78 {
+                info!("PCIe cap located at {c:#04x} (not the measured 0x78) - FLR uses the walked offset");
+            }
+            c
+        }
+        None => {
+            info!("PCIe cap walk found nothing (no cap list?) - falling back to the measured 0x78 offset; an FLR may be a no-op here");
+            0x78
+        }
+    }
+}
+
 /// Logs the GPU's command, status and device control, then the IDs, command,
 /// status, bus numbers and bridge control of every PCI bridge. Read-only.
 #[cfg(feature = "tx")]
 pub fn log_dma_path(tag: &str, gpu: &PciIo) {
-    // PCIe cap at 0x78: Device Control at +0x08.
+    // PCIe cap from the capability walk: Device Control lives at +0x08.
+    let pcie = pcie_cap_or_measured(gpu);
     info!(
-        "DMA-PATH[{tag}]: gpu loc={:?} command={:#06x} status={:#06x} devctl={:#06x}",
+        "DMA-PATH[{tag}]: gpu loc={:?} command={:#06x} status={:#06x} devctl={:#06x} (cap {pcie:#04x})",
         gpu.get_location(),
         gpu.config_read_u16(0x04),
         gpu.config_read_u16(0x06),
-        gpu.config_read_u16(0x78 + 0x08)
+        gpu.config_read_u16(pcie as u32 + 0x08)
     );
     let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&PciIo::GUID)) else {
         info!("DMA-PATH[{tag}]: locate_handle_buffer failed");
@@ -673,6 +804,90 @@ pub fn log_dma_path(tag: &str, gpu: &PciIo) {
             buses & 0xff,
             buses >> 8 & 0xff,
             buses >> 16 & 0xff,
+            pci.config_read_u16(0x3e)
+        );
+    }
+}
+
+/// Read-only handoff-time PCI snapshot (issue #61 ask #2): GPU config
+/// header, capability walk (PCIe DevCtl/LnkCtl + MSI enable), and every
+/// bridge's Command / Bridge Control (VGA routing bits). Runs after the
+/// FLR/verify phase and before the reconnect, so the log pairs directly
+/// with the Windows-side pnputil dump of the same boot: a resource-class
+/// delta between the two pinpoints which side changed what.
+#[cfg(feature = "tx")]
+pub fn diag_handoff_pci(gpu: &PciIo) {
+    info!(
+        "HANDOFF-PCI gpu cfg00-1f: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        gpu.config_read_u32(0x00),
+        gpu.config_read_u32(0x04),
+        gpu.config_read_u32(0x08),
+        gpu.config_read_u32(0x0c),
+        gpu.config_read_u32(0x10),
+        gpu.config_read_u32(0x14),
+        gpu.config_read_u32(0x18),
+        gpu.config_read_u32(0x1c),
+    );
+    info!(
+        "HANDOFF-PCI gpu cfg20-3f: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        gpu.config_read_u32(0x20),
+        gpu.config_read_u32(0x24),
+        gpu.config_read_u32(0x28),
+        gpu.config_read_u32(0x2c),
+        gpu.config_read_u32(0x30),
+        gpu.config_read_u32(0x34),
+        gpu.config_read_u32(0x38),
+        gpu.config_read_u32(0x3c),
+    );
+    // Capability walk from the 0x34 pointer; PCIe (0x10) and MSI (0x05)
+    // get field decodes, anything else is listed by id. Bounded so a
+    // poisoned pointer cannot loop.
+    let mut ptr = gpu.config_read_u8(0x34) as u32;
+    for _ in 0..16 {
+        if ptr == 0 || ptr >= 0xff {
+            break;
+        }
+        let id = gpu.config_read_u8(ptr);
+        let next = gpu.config_read_u8(ptr + 1) as u32;
+        match id {
+            0x10 => info!(
+                "HANDOFF-PCI cap PCIe@{ptr:#04x}: devcap={:#06x} devctl={:#06x} devsta={:#06x} lnkcap={:#08x} lnkctl={:#06x} lnksta={:#06x}",
+                gpu.config_read_u16(ptr + 4),
+                gpu.config_read_u16(ptr + 8),
+                gpu.config_read_u16(ptr + 0xa),
+                gpu.config_read_u32(ptr + 0xc),
+                gpu.config_read_u16(ptr + 0x10),
+                gpu.config_read_u16(ptr + 0x12),
+            ),
+            0x05 => info!(
+                "HANDOFF-PCI cap MSI@{ptr:#04x}: mc={:#06x}",
+                gpu.config_read_u16(ptr + 2)
+            ),
+            other => info!("HANDOFF-PCI cap id={other:#04x}@{ptr:#04x}"),
+        }
+        ptr = next;
+    }
+    let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&PciIo::GUID)) else {
+        info!("HANDOFF-PCI bridge scan: locate_handle_buffer failed");
+        return;
+    };
+    for handle in handles.iter() {
+        // Safety: GetProtocol performs no driver binding (same as log_dma_path).
+        let Ok(pci) = (unsafe {
+            boot::open_protocol::<PciIo>(
+                OpenProtocolParams { handle: *handle, agent: boot::image_handle(), controller: None },
+                OpenProtocolAttributes::GetProtocol,
+            )
+        }) else {
+            continue;
+        };
+        if pci.config_read_u16(0x00) == 0xffff || pci.config_read_u8(0x0e) & 0x7f != 0x01 {
+            continue;
+        }
+        let loc = pci.get_location();
+        info!(
+            "HANDOFF-PCI bridge {loc:?} cmd={:#06x} bridgectl={:#06x}",
+            pci.config_read_u16(0x04),
             pci.config_read_u16(0x3e)
         );
     }
@@ -803,7 +1018,11 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
         info!("  no capability list");
     } else {
         let mut cap_ptr = pci.config_read_u8(0x34) & 0xfc;
-        while cap_ptr != 0 {
+        // Bounded: a malformed or self-referential chain must not hang the app
+        // before the transaction even starts (no log line, no chain-load).
+        let mut cap_guard = 0u32;
+        while cap_ptr != 0 && cap_guard < 48 {
+            cap_guard += 1;
             let cap_id = pci.config_read_u8(cap_ptr.into());
             match cap_id {
                 0x10 => {
@@ -813,7 +1032,7 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
                         "  PCIe cap @{:#04x}: DEVCAP {:#010x} (FLR {}) LINKCAP {:#010x}",
                         cap_ptr,
                         devcap,
-                        if devcap & (1 << 15) != 0 { "yes" } else { "no" },
+                        if devcap & (1 << 28) != 0 { "yes" } else { "no" },
                         link_cap
                     );
                 }
@@ -827,7 +1046,17 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
 
     // Extended capability list at 0x100 (ReBAR lives here).
     let mut off: u32 = 0x100;
+    let mut ext_guard = 0u32;
     loop {
+        // Extended capabilities live at 0x100+, but the list is NOT ordered by
+        // offset: a field-measured AD106 chain goes 0x100 -> 0x250 -> 0x258 ->
+        // 0x128 -> ... (backwards at 0x258 -> 0x128). Only the terminator, a
+        // pointer below 0x100, and the iteration cap below bound this walk.
+        ext_guard += 1;
+        if ext_guard > 256 {
+            info!("  ext cap walk stopped after 256 entries (malformed list)");
+            break;
+        }
         let hdr = pci.config_read_u32(off);
         let id = (hdr & 0xffff) as u16;
         if id == 0x0000 {
@@ -856,7 +1085,16 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
             }
             other => info!("  ext cap {:#06x} @{:#06x}", other, off),
         }
-        if next == 0 {
+        // Extended capability chains are NOT ordered by offset - a PCIe list
+        // may point backwards. Field-measured on an AD106 the full chain is
+        //   0x100 -> 0x250 -> 0x258 -> 0x128 -> 0x420 -> 0x600 -> 0x900 ->
+        //   0xbb0 -> 0xc1c -> 0xd00 -> 0xe00 -> 0
+        // (the backwards step is 0x258 -> 0x128; an earlier note here showed a
+        // truncated chain that appeared to terminate at 0x420). A monotonicity
+        // check therefore truncates a valid list, so only the terminator and a
+        // malformed below-0x100 pointer end the walk; the iteration cap above
+        // is what bounds a cyclic one.
+        if next == 0 || next < 0x100 {
             break;
         }
         off = next;

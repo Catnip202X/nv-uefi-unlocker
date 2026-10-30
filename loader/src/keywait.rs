@@ -40,13 +40,14 @@ pub fn wait_any_key_or_timeout(seconds: u64) -> KeyOrTimeout {
     KeyOrTimeout::Timeout
 }
 
-/// CONFIRM-phase wait (issue #4.1). TX builds: ONLY Space proceeds - the
-/// banner ("30s no-key = ABORT to Windows") and the README ("press Space to
-/// confirm") promise exactly this; any other key or the 30s timeout aborts
-/// into chain-load with zero GPU writes, so a stick left in a machine that
-/// happens to boot from it can never run the transaction unattended.
-/// Read-only builds keep the M0 semantics (any key / timeout proceeds;
-/// everything is zero-write by design).
+/// CONFIRM-phase wait (issue #4.1). TX builds: ONLY Space or Enter proceeds
+/// (Enter after Space-muscle-memory from shell/BIOS menus; before it aborted
+/// and the run looked "finished" while nothing happened - easy to misread
+/// as a failed attempt); any other key or the 30s timeout aborts into
+/// chain-load with zero GPU writes and says so explicitly, so a stick left
+/// in a machine that happens to boot from it can never run the transaction
+/// unattended. Read-only builds keep the M0 semantics (any key / timeout
+/// proceeds; everything is zero-write by design).
 pub fn wait_confirm(seconds: u64) -> Confirm {
     let ticks = seconds * 20;
     for _ in 0..ticks {
@@ -57,8 +58,14 @@ pub fn wait_confirm(seconds: u64) -> Confirm {
                     info!("CONFIRM: Space pressed, proceeding");
                     return Confirm::Proceed;
                 }
+                Key::Printable(c) if u16::from(c) == 0x0d => {
+                    info!("CONFIRM: Enter pressed, proceeding");
+                    return Confirm::Proceed;
+                }
                 other => {
-                    info!("CONFIRM: {other:?} is not Space - ABORT (no GPU writes this boot)");
+                    info!(
+                        "CONFIRM: {other:?} - ABORT to Windows, NOTHING was unlocked this boot (zero GPU writes)"
+                    );
                     return Confirm::Abort;
                 }
             }
@@ -72,7 +79,7 @@ pub fn wait_confirm(seconds: u64) -> Confirm {
     }
     #[cfg(feature = "tx")]
     {
-        info!("CONFIRM: {seconds}s timeout - ABORT to Windows (no GPU writes this boot)");
+        info!("CONFIRM: {seconds}s timeout - ABORT to Windows, NOTHING was unlocked this boot (zero GPU writes)");
         Confirm::Abort
     }
     #[cfg(not(feature = "tx"))]

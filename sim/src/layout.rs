@@ -214,8 +214,8 @@ mod tests {
             24 * 1024,
             0,
             1,
-            (((low >> 12) as u32) << 4),
-            (((((24u64 << 30) - 4096) >> 12) as u32) << 4),
+            ((low >> 12) as u32) << 4,
+            ((((24u64 << 30) - 4096) >> 12) as u32) << 4,
         );
         let (i, _) = r.as_ref().unwrap();
         assert!(i.mmu_lock_valid, "top lock (2 MiB window) must be honored");
@@ -229,8 +229,8 @@ mod tests {
             24 * 1024,
             0,
             1,
-            (((low >> 12) as u32) << 4),
-            (((((24u64 << 30) - 4096) >> 12) as u32) << 4),
+            ((low >> 12) as u32) << 4,
+            ((((24u64 << 30) - 4096) >> 12) as u32) << 4,
         );
         assert_eq!(r.unwrap_err(), LayoutError::BelowScrubTop);
     }

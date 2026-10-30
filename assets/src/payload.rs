@@ -37,9 +37,8 @@ pub const PATCHED_WORDS_GA102: &[(usize, u32)] = &[
 pub fn build_payload(fill: u32, size: usize, patched: &[(usize, u32)]) -> Vec<u8> {
     assert_eq!(size % 4, 0, "payload size must be dword-aligned");
     let mut out = vec![0u8; size];
-    for (i, chunk) in out.chunks_exact_mut(4).enumerate() {
-        chunk.copy_from_slice(&fill.to_le_bytes()[..4]);
-        let _ = i;
+    for chunk in out.as_chunks_mut::<4>().0 {
+        chunk.copy_from_slice(&fill.to_le_bytes());
     }
     for &(off, value) in patched {
         assert!(off + 4 <= size, "patch word outside payload");
