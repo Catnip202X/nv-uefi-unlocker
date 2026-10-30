@@ -343,11 +343,15 @@ pub fn wpr_meta_pack(
     // bit-for-bit: heapOffset = 0x1f7900000.
     let (nonwpr_off, nonwpr_size, wpr_start, heap_off, heap_size, flags) = if family == "tu10x" {
         const MB: u64 = 1024 * 1024;
-        let hs = match fb_size {
-            0x280000000 => 0x7F00000, // 10 GiB
-            0x500000000 => 0xFE00000, // 20 GiB
-            _ => 0x6900000,           // 8 GiB (40HX live value)
-        };
+        // TU10x driver formula (RM 615.71.09 source, issue #57): heap =
+        // 8 MiB (BASE_RM) + align_1MiB(96 KiB x GiB) + 96 MiB (CLIENT),
+        // osCarveout = 0 on TU102/TU106. Reproduces every hardware-verified
+        // point: 8G -> 105 MiB (40HX live dump), 22G -> 107 MiB (issue #17 C
+        // reference), 24G -> 107 MiB (TITAN RTX, issue #57). Replaces the
+        // per-size table; the old 10G/20G rows were GA102-sourced and never
+        // applied to a Turing SKU.
+        let gib = (fb_size + ((1 << 30) - 1)) >> 30; // driver: ALIGN_UP64(fbSize, 1GiB) >> 30
+        let hs = (8 * MB) + ((((96 << 10) * gib) + MB - 1) & !(MB - 1)) + (96 * MB);
         let ho = (layout.gsp_offset - hs) & !(MB - 1);
         let ws = ho - MB;
         info!(
