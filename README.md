@@ -6,6 +6,8 @@
 
 [原理科普 - 入门用户友好版（Bilibili, 简体中文）](https://www.bilibili.com/opus/1264493051219279872)
 
+[Reddit 讨论（English）](https://www.reddit.com/r/overclocking/comments/1xj5jp3/new_uefi_gpu_unlocking_tool_revealed_for_windows/)
+
 [中文](README.md) | [English](README.en.md)
 
 20 \~ 40系 全平台操作系统通用 UEFI 预驱动 NVIDIA GPU 解锁器（开发环境为 Windows，Rust）。在 NVIDIA 驱动加载**之前**的
