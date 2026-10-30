@@ -192,7 +192,15 @@ fn tx_one_card(g: &pci::FoundGpu) {
     let gsp_boot = tx::read_boot_file_fmt("\\gsp_boot_{}.bin", family);
     let gsp_image = tx::read_boot_file_fmt("\\fwimage_{}.bin", family);
     let stock_sig = tx::read_boot_file_fmt("\\fwsignature_{}.bin", family);
-    let v67 = tx::read_boot_file_fmt("\\v67-{}-four-plm.bin", family);
+    // \v67-direct-ss.bin override (issues #17/#62): the four-plm payload
+    // (b0ec9029…) and the CMP-lineage direct-SS payload (de7288bc…, xrip
+    // cmp50hx-unlock blobs/v67_payload.bin — the SAME word table the C
+    // reference ran and PR #49's compat path verified on the #17 card)
+    // differ byte-wise; everything else in the two chains is hash-identical
+    // (booter image, gsp_boot slice, sec2_bl - issue #62 comment
+    // 6514938280). This marker swaps ONLY the payload.
+    let v67 = tx::read_boot_file("\\v67-direct-ss.bin")
+        .or_else(|| tx::read_boot_file_fmt("\\v67-{}-four-plm.bin", family));
     let bl = if family == "tu10x" {
         tx::read_boot_file("\\sec2_bl_tu10x.bin")
     } else {

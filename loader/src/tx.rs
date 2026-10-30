@@ -902,8 +902,7 @@ pub fn validate_asset_sizes(assets: &TxAssets) -> Result<(), TxError> {
     if let Some(v67) = &assets.v67 {
         if v67.len() != tb::V67_SIZE {
             info!(
-                "TX: \\v67-{}-four-plm.bin is {} bytes, want exactly {} (0xfa00) - refusing to run (truncated or damaged stick?)",
-                assets.family,
+                "TX: v67 payload is {} bytes, want exactly {} (0xfa00) - refusing to run (truncated or damaged stick?)",
                 v67.len(),
                 tb::V67_SIZE
             );
