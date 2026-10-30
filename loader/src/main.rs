@@ -210,7 +210,23 @@ fn tx_one_card(g: &pci::FoundGpu) {
     let gsp_boot = must_asset!("gsp_boot", tx::read_asset_fmt("\\gsp_boot_{}.bin", family));
     let gsp_image = must_asset!("fwimage", tx::read_asset_fmt("\\fwimage_{}.bin", family));
     let stock_sig = must_asset!("fwsignature", tx::read_asset_fmt("\\fwsignature_{}.bin", family));
-    let v67 = must_asset!("v67 payload", tx::read_asset_fmt("\\v67-{}-four-plm.bin", family));
+    // \v67-direct-ss.bin override (issues #17/#62): the four-plm payload
+    // (b0ec9029…) and the CMP-lineage direct-SS payload (de7288bc…, xrip
+    // cmp50hx-unlock blobs/v67_payload.bin — the SAME word table the C
+    // reference ran and PR #49's compat path verified on the #17 card)
+    // differ byte-wise; everything else in the two chains is hash-identical
+    // (booter image, gsp_boot slice, sec2_bl - issue #62 comment
+    // 6514938280). This marker swaps ONLY the payload. Same strict
+    // semantics as every other asset: present-but-unreadable aborts, it
+    // never degrades to the family-pinned payload.
+    let v67 = match tx::read_asset("\\v67-direct-ss.bin") {
+        Ok(Some(v)) => Some(v),
+        Ok(None) => must_asset!("v67 payload", tx::read_asset_fmt("\\v67-{}-four-plm.bin", family)),
+        Err(()) => {
+            info!("TX: \\v67-direct-ss.bin is present but unreadable (damaged stick or pulled media) - aborting before any GPU interaction");
+            return;
+        }
+    };
     let bl = if family == "tu10x" {
         must_asset!("sec2_bl", tx::read_asset("\\sec2_bl_tu10x.bin"))
     } else {
