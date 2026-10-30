@@ -302,6 +302,30 @@ impl PciIo {
         None
     }
 
+    /// Walk the legacy capability list for the PCI Express capability
+    /// (ID 0x10). The FLR path must locate it instead of assuming 0x78: that
+    /// offset is right on every card measured here, but nothing guarantees it,
+    /// and "Device Control bit 15" written into an unrelated dword is not a
+    /// reset - it is an arbitrary config-space write that leaves the function
+    /// untouched. Same iteration guard as `pm_cap` (a self-referential chain
+    /// would otherwise hang the firmware app with no log line).
+    #[cfg(feature = "tx")]
+    pub fn pcie_cap(&self) -> Option<u8> {
+        if self.config_read_u16(0x06) & 0x10 == 0 {
+            return None; // STATUS.CAP_LIST absent
+        }
+        let mut ptr = self.config_read_u8(0x34) & 0xfc;
+        let mut guard = 0;
+        while ptr != 0 && guard < 48 {
+            if self.config_read_u8(ptr.into()) == 0x10 {
+                return Some(ptr);
+            }
+            ptr = self.config_read_u8(ptr as u32 + 1) & 0xfc;
+            guard += 1;
+        }
+        None
+    }
+
     /// PMCSR read (PM capability + 4). Bits 1:0 = PowerState.
     #[cfg(feature = "tx")]
     pub fn pmcsr(&self, cap: u8) -> u16 {
@@ -347,7 +371,7 @@ impl PciIo {
         // \tx-low-staging.txt forces the legacy PciIo path for A/B testing.
         if !TX_HIGH_STAGING.load(core::sync::atomic::Ordering::Relaxed) {
             info!("DMA alloc: family not gated for >4GB staging - legacy PciIo path");
-        } else if crate::tx::read_boot_file("\\tx-low-staging.txt").is_some() {
+        } else if crate::tx::probe_file("\\tx-low-staging.txt") {
             info!("DMA alloc: \\tx-low-staging.txt present - legacy sub-4GB PciIo path forced");
         } else if let Ok(b) = self.dma_alloc_high(len) {
             return Ok(b);
@@ -719,17 +743,38 @@ fn parse_bdf(raw: &[u8]) -> Option<(usize, usize, usize, usize)> {
     Some((seg, bus, dev, fun))
 }
 
+/// Resolve the PCI Express capability offset for the FLR path. The walk is
+/// authoritative; the historical 0x78 is only a fallback for a firmware/card
+/// combination where the capability list itself is unreadable, and it is
+/// logged so the evidence record shows which branch ran.
+#[cfg(feature = "tx")]
+pub fn pcie_cap_or_measured(gpu: &PciIo) -> u8 {
+    match gpu.pcie_cap() {
+        Some(c) => {
+            if c != 0x78 {
+                info!("PCIe cap located at {c:#04x} (not the measured 0x78) - FLR uses the walked offset");
+            }
+            c
+        }
+        None => {
+            info!("PCIe cap walk found nothing (no cap list?) - falling back to the measured 0x78 offset; an FLR may be a no-op here");
+            0x78
+        }
+    }
+}
+
 /// Logs the GPU's command, status and device control, then the IDs, command,
 /// status, bus numbers and bridge control of every PCI bridge. Read-only.
 #[cfg(feature = "tx")]
 pub fn log_dma_path(tag: &str, gpu: &PciIo) {
-    // PCIe cap at 0x78: Device Control at +0x08.
+    // PCIe cap from the capability walk: Device Control lives at +0x08.
+    let pcie = pcie_cap_or_measured(gpu);
     info!(
-        "DMA-PATH[{tag}]: gpu loc={:?} command={:#06x} status={:#06x} devctl={:#06x}",
+        "DMA-PATH[{tag}]: gpu loc={:?} command={:#06x} status={:#06x} devctl={:#06x} (cap {pcie:#04x})",
         gpu.get_location(),
         gpu.config_read_u16(0x04),
         gpu.config_read_u16(0x06),
-        gpu.config_read_u16(0x78 + 0x08)
+        gpu.config_read_u16(pcie as u32 + 0x08)
     );
     let Ok(handles) = boot::locate_handle_buffer(SearchType::ByProtocol(&PciIo::GUID)) else {
         info!("DMA-PATH[{tag}]: locate_handle_buffer failed");
@@ -889,7 +934,11 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
         info!("  no capability list");
     } else {
         let mut cap_ptr = pci.config_read_u8(0x34) & 0xfc;
-        while cap_ptr != 0 {
+        // Bounded: a malformed or self-referential chain must not hang the app
+        // before the transaction even starts (no log line, no chain-load).
+        let mut cap_guard = 0u32;
+        while cap_ptr != 0 && cap_guard < 48 {
+            cap_guard += 1;
             let cap_id = pci.config_read_u8(cap_ptr.into());
             match cap_id {
                 0x10 => {
@@ -899,7 +948,7 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
                         "  PCIe cap @{:#04x}: DEVCAP {:#010x} (FLR {}) LINKCAP {:#010x}",
                         cap_ptr,
                         devcap,
-                        if devcap & (1 << 15) != 0 { "yes" } else { "no" },
+                        if devcap & (1 << 28) != 0 { "yes" } else { "no" },
                         link_cap
                     );
                 }
@@ -913,7 +962,17 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
 
     // Extended capability list at 0x100 (ReBAR lives here).
     let mut off: u32 = 0x100;
+    let mut ext_guard = 0u32;
     loop {
+        // Extended capabilities live at 0x100+, but the list is NOT ordered by
+        // offset: a field-measured AD106 chain goes 0x100 -> 0x250 -> 0x258 ->
+        // 0x128 -> ... (backwards at 0x258 -> 0x128). Only the terminator, a
+        // pointer below 0x100, and the iteration cap below bound this walk.
+        ext_guard += 1;
+        if ext_guard > 256 {
+            info!("  ext cap walk stopped after 256 entries (malformed list)");
+            break;
+        }
         let hdr = pci.config_read_u32(off);
         let id = (hdr & 0xffff) as u16;
         if id == 0x0000 {
@@ -942,7 +1001,16 @@ fn describe_nvidia(pci: &PciIo, seg: usize, bus: usize, dev: usize, fun: usize, 
             }
             other => info!("  ext cap {:#06x} @{:#06x}", other, off),
         }
-        if next == 0 {
+        // Extended capability chains are NOT ordered by offset - a PCIe list
+        // may point backwards. Field-measured on an AD106 the full chain is
+        //   0x100 -> 0x250 -> 0x258 -> 0x128 -> 0x420 -> 0x600 -> 0x900 ->
+        //   0xbb0 -> 0xc1c -> 0xd00 -> 0xe00 -> 0
+        // (the backwards step is 0x258 -> 0x128; an earlier note here showed a
+        // truncated chain that appeared to terminate at 0x420). A monotonicity
+        // check therefore truncates a valid list, so only the terminator and a
+        // malformed below-0x100 pointer end the walk; the iteration cap above
+        // is what bounds a cyclic one.
+        if next == 0 || next < 0x100 {
             break;
         }
         off = next;

@@ -258,12 +258,17 @@ pub fn find_fwsec(image: &[u8], debug: bool) -> Result<(UcodeEntry, Desc), Vbios
     let (entries, expansion, _) = find_ucode_table(image)?;
     let want = if debug { APP_ID_FWSEC_DBG } else { APP_ID_FWSEC_PROD };
     for e in entries {
-        if e.app_id == want || e.app_id == APP_ID_FIRMWARE_SEC_LIC {
-            let desc = parse_desc(image, expansion, &e)?;
-            if e.app_id == want {
-                return Ok((e, desc));
-            }
+        // Only the requested entry is parsed. The old loop also parsed the
+        // FIRMWARE_SEC_LIC (0x05) entry and then dropped the result, but its
+        // error escaped through `?` - so a card whose licence container uses
+        // an older descriptor revision failed FWSEC extraction with
+        // "unsupported descriptor version" even with a valid 0x85 entry
+        // right behind it.
+        if e.app_id != want {
+            continue;
         }
+        let desc = parse_desc(image, expansion, &e)?;
+        return Ok((e, desc));
     }
     Err(VbiosError::NoFwsecEntry { debug })
 }
@@ -334,5 +339,71 @@ mod tests {
         // Debug track is a SEPARATE descriptor with the same geometry.
         let (_, dbg_desc) = find_fwsec(img, true).expect("FWSEC_DBG");
         assert_eq!(dbg_desc, desc, "AD107M debug track bit-identical geometry");
+    }
+
+    /// Synthetic minimal VBIOS: two-image expansion ROM, one BIT header with a
+    /// single 0x70/v2 token, and a ucode table whose FIRST entry is the
+    /// FIRMWARE_SEC_LIC (0x05) container with a V1 descriptor, followed by the
+    /// real FWSEC_PROD (0x85) V2 entry. Regression for the walk that used to
+    /// abort on the LIC entry (`?` on a result it then discarded).
+    fn synthetic_vbios_lic_then_fwsec() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x800];
+        rom[0] = 0x55; // option-ROM signature 0xAA55 (LE) - find_expansion_offset requires it
+        rom[1] = 0xAA;
+        // Image 0 (code type 0x00): sets the expansion-RAM base size.
+        rom[0x18..0x1a].copy_from_slice(&0x20u16.to_le_bytes()); // PCIR pointer
+        rom[0x20..0x24].copy_from_slice(b"PCIR");
+        rom[0x2a..0x2c].copy_from_slice(&0x18u16.to_le_bytes()); // struct length
+        rom[0x30..0x32].copy_from_slice(&1u16.to_le_bytes()); // image length x512
+        rom[0x34] = 0x00; // code type: not the last image
+        // Image 1 at 0x200 (code type 0xE0): expansion offset = 0x200-0x200 = 0.
+        rom[0x218..0x21a].copy_from_slice(&0x20u16.to_le_bytes());
+        rom[0x220..0x224].copy_from_slice(b"PCIR");
+        rom[0x22a..0x22c].copy_from_slice(&0x18u16.to_le_bytes());
+        rom[0x230..0x232].copy_from_slice(&1u16.to_le_bytes());
+        rom[0x234] = 0xE0;
+        // BIT header @0x400: 12-byte header, stride 8, one token, zero-sum.
+        let bit = 0x400usize;
+        rom[bit] = 0xFF; // little-endian 0xB8FF signature
+        rom[bit + 1] = 0xB8;
+        rom[bit + 2..bit + 6].copy_from_slice(b"BIT\0");
+        rom[bit + 6] = 0x55; // checksum padding byte
+        rom[bit + 8] = 12; // header size
+        rom[bit + 9] = 8; // token stride
+        rom[bit + 10..bit + 12].copy_from_slice(&1u16.to_le_bytes()); // one token
+        // Token 0x70 / data version 2 -> pointer 0x500 -> table at 0x600.
+        rom[bit + 12] = 0x70;
+        rom[bit + 13] = 0x02;
+        rom[bit + 14..bit + 16].copy_from_slice(&4u16.to_le_bytes());
+        rom[bit + 16..bit + 20].copy_from_slice(&0x500u32.to_le_bytes());
+        rom[0x500..0x504].copy_from_slice(&0x600u32.to_le_bytes());
+        // ucode table header: ver 1, hdr 6, entry 8, count 2.
+        rom[0x600] = 1;
+        rom[0x601] = 6;
+        rom[0x602] = 8;
+        rom[0x603] = 2;
+        rom[0x604] = 1;
+        rom[0x605] = 0x2c; // descriptor version marker (unused by the parser)
+        // entry 0: FIRMWARE_SEC_LIC -> V1 descriptor (version byte 1).
+        rom[0x606] = APP_ID_FIRMWARE_SEC_LIC;
+        rom[0x608..0x60c].copy_from_slice(&0x700u32.to_le_bytes());
+        rom[0x700..0x704].copy_from_slice(&0x0028_0101u32.to_le_bytes()); // 40B, ver 1
+        // entry 1: FWSEC_PROD -> V2 descriptor at 0x780, stored size 0x1234.
+        rom[0x60e] = APP_ID_FWSEC_PROD;
+        rom[0x610..0x614].copy_from_slice(&0x780u32.to_le_bytes());
+        rom[0x780..0x784].copy_from_slice(&0x003C_0201u32.to_le_bytes()); // 60B, ver 2
+        rom[0x784..0x788].copy_from_slice(&0x1234u32.to_le_bytes());
+        rom
+    }
+
+    #[test]
+    fn fwsec_walk_skips_the_lic_container() {
+        let rom = synthetic_vbios_lic_then_fwsec();
+        let (entry, desc) = find_fwsec(&rom, false).expect("FWSEC_PROD must be found behind the LIC entry");
+        assert_eq!(entry.app_id, APP_ID_FWSEC_PROD);
+        match desc {
+            Desc::V2(v2) => assert_eq!(v2.stored_size, 0x1234),
+            other => panic!("expected the V2 descriptor, got {other:?}"),
+        }
     }
 }
