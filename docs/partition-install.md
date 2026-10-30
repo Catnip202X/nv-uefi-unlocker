@@ -1,8 +1,7 @@
 # Running without a USB stick: a dedicated FAT32 partition
 
-The route is the one field-tested in issue #33, not an invention: a small FAT32 partition
-holding the assets at its **root**, plus one firmware boot entry. It leaves the EFI System
-Partition's files alone and adds nothing to `\EFI\NVU`.
+The route is the one field-tested in issue #33, not an invention: a small FAT32 partition holding the assets at its **root**, plus one firmware boot entry.
+It adds no file to the EFI System Partition, but it does add an entry to the BCD store, which lives there. That part is unavoidable: every boot entry is a BCD object.
 
 ## Why the root of its own partition
 
@@ -22,16 +21,19 @@ at the stick root"), so this route is the same convention with a different volum
 |---|---|
 | `<partition>:\` | `BOOTX64.EFI`, the family's `.bin` assets, optional markers, `nvu-install-manifest.txt` |
 | firmware NVRAM | one boot entry, a copy of `{bootmgr}` with `device=<partition>`, `path=BOOTX64.EFI` |
-| the ESP's BCD store | the object for that entry - written by `bcdedit` itself, not by this project |
+| the ESP's BCD store | the object for that entry - written by `bcdedit` itself; this is the one thing on the ESP that changes, and it is unavoidable |
 
 `loader.log` is written to the root of that partition on every boot, as it is on a stick.
+
+The only way past the ESP refusal is `-Force`, which prints a warning and continues; it exists so a machine whose partition table cannot be read is not a dead end, and it is the sole path by which this script will ever write into an ESP.
 
 ## The three prohibitions
 
 1. **Never make the entry the Windows default.** If the transaction refuses or fails, the
    machine would come up with no Windows path, and `-Uninstall` needs a booted Windows. The
-   script checks and undoes this if it ever happens.
-2. **Do not copy `i_know_what_iam_doing.txt`.** It turns the 5 s confirmation into an
+   script never writes `{bootmgr} default` at all, which is stronger than checking afterwards;
+   it is your job not to run `bcdedit /set {bootmgr} default` afterwards either.
+2. **Do not copy `i_know_what_i_am_doing.txt`.** It turns the 5 s confirmation into an
    unattended run on every boot. The script skips it unless `-AllowArmed` is given.
 3. **The assets are not the firmware you already trust.** A damaged `.bin` on an internal
    partition is not visible until the next boot; the USB route at least forces you to handle
